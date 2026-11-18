@@ -1,0 +1,91 @@
+# release-please keeps a "release PR" open that bumps version.txt and
+# CHANGELOG.md from Conventional Commit messages (feat:, fix:, ...). Merging
+# that PR tags the release; the build-release job then builds the firmware at
+# that tag and attaches blas-vX.Y.Z.bin (+ .elf, SHA256SUMS.txt).
+#
+# To (re)build an existing release by hand, e.g. to backfill a release that
+# has no .bin: Actions -> Release -> Run workflow -> tag: v0.4.0
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and attach firmware to (e.g. v0.4.0). Leave empty to just run release-please."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    if: ${{ github.event_name == 'push' || !inputs.tag }}
+    runs-on: ubuntu-24.04
+    outputs:
+      # `releases_created` is always set by release-please-action v4; the
+      # root-component `release_created` is not reliable, so don't gate on it.
+      releases_created: ${{ steps.rp.outputs.releases_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-release:
+    needs: release-please
+    if: >-
+      ${{ always() && (
+        (github.event_name == 'workflow_dispatch' && inputs.tag) ||
+        needs.release-please.outputs.releases_created == 'true'
+      ) }}
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Resolve release tag
+        env:
+          TAG_IN: ${{ inputs.tag || needs.release-please.outputs.tag_name }}
+        run: |
+          TAG="$TAG_IN"
+          if [ -z "$TAG" ]; then
+            # Fallback: the release release-please just created is the newest.
+            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not determine the release tag"; exit 1
+          fi
+          gh release view "$TAG" > /dev/null   # fail early if no such release
+          echo "Building firmware for $TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install ARM toolchain
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '13.2.Rel1'
+
+      - name: Build
+        run: |
+          MAKEFLAGS="-j$(nproc)" sh setup.sh
+          make -j"$(nproc)"
+          make test
+
+      - name: Attach firmware to the release
+        run: |
+          mkdir -p dist
+          cp build/blas.bin "dist/blas-${TAG}.bin"
+          cp build/blas.elf "dist/blas-${TAG}.elf"
+          (cd dist && sha256sum blas-* > SHA256SUMS.txt)
+          gh release upload "$TAG" dist/* --clobber
+          echo "### Attached to ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+          ls -1 dist >> "$GITHUB_STEP_SUMMARY"

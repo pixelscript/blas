@@ -1,0 +1,50 @@
+# Builds the firmware on every push and pull request, runs the host-side
+# tests, and attaches blas.bin (+ .elf) as a workflow artifact. Tagged
+# releases are built separately by release-please.yml.
+#
+# The Alchemy SDK and libDaisy are not submodules here: setup.sh clones the
+# pinned commits into lib/ and builds libDaisy.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '13.2.Rel1'
+
+      - name: Fetch the SDK and libDaisy, build libDaisy
+        run: MAKEFLAGS="-j$(nproc)" sh setup.sh
+
+      - name: Build firmware
+        run: make -j"$(nproc)"
+
+      - name: Host tests
+        run: make test
+
+      - name: Name artifacts
+        run: |
+          VERSION=$(cat version.txt)
+          SHA=$(git rev-parse --short HEAD)
+          mkdir -p dist
+          cp build/blas.bin "dist/blas-${VERSION}-${SHA}.bin"
+          cp build/blas.elf "dist/blas-${VERSION}-${SHA}.elf"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blas-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
