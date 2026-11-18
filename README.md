@@ -5,13 +5,12 @@
 
 **A side-chain ducker that brings its own kick and snare, for the Hermetic Modular Alchemy Lab
 (V2).** Stereo audio goes in, a trigger ducks it, and the same trigger plays a 909-style kick that
-lands in the hole it just made. A second trigger does the same with a snare. The ducking can be
-plain volume, low band only, or an EQ cut that follows each drum's tuning.
+lands in the hole it just made. A second trigger plays a snare, which does not duck. The ducking can
+be plain volume, low band only, or an EQ cut that follows the kick's tuning.
 
-> **Status: v0.1.0, not yet run on hardware.** The firmware builds for the module, and the audio
-> engine, the hold gesture, the CV depths and the web-editor descriptor pass the host tests in
-> `tests/`. The sound of the drums and the feel of the gestures have not been heard or tried on a
-> real Alchemy Lab. See [First flash checklist](#first-flash-checklist).
+> **Status: v0.3.2.** The firmware builds for the module, and the audio engine, the button
+> gestures, the CV depths and the web-editor descriptor pass the host tests in `tests/`. The voices
+> and the reverb were designed on paper and checked for level and pitch, not tuned by ear.
 
 Blas is laid out like Athanor: three rows, a button per row, a CV input per row.
 
@@ -26,15 +25,15 @@ J9 / J10  audio out L / R           J4   snare trigger
                                     J8   duck envelope out
 ```
 
-Signal flow: **In → ducker → + kick + snare → soft clip → Out.** The drums are added after the
-ducker, so they are never ducked themselves.
+Signal flow: **In → ducker → + kick + snare + reverb → soft clip → Out.** The drums and their reverb
+are added after the ducker, so they are never ducked themselves.
 
 ## Buttons
 
 | Gesture | What it does |
 |---|---|
 | **Tap** a row's button | Opens that row's six-knob options page. Tap it again to go back. Tapping another row's button jumps straight to that row's page. |
-| **Hold** a row's button **and turn a knob** | Sets how much that row's CV jack moves that knob. |
+| **Hold** a row's button **and turn one of its knobs** | Sets how much that row's CV jack moves that knob. On the main page a button reaches its own pair; on its own options page it reaches all six. |
 | **Hold B2 + B3** for two seconds | Opens the Settings menu (B1 steps through its pages, B2 or B3 leaves). |
 
 Each button wears its row's colour: violet for the ducker, orange for the kick, blue for the snare.
@@ -89,12 +88,12 @@ value. A small pip shows where the knob physically is until then.
 | P3 Tone | | Brightness of the snare noise. |
 | P4 Bend | | Pitch drop on the shell. |
 | P5 Drive | | Saturation. |
-| P6 Duck | 0 to 100% | How much a snare trigger ducks. |
+| P6 Reverb | | A stereo room on the snare. One knob raises the level and lengthens the decay together, from a small tight room (0.3 s) to a hall (3.5 s). Zero is off. Settings can send the kick to it as well. |
 
-Each drum has its own duck envelope. They share Attack, Hold, Release and Curve, and each has its
-own amount (the two Duck knobs). Out of the box the kick ducks fully and the snare at 40%.
+Only the kick ducks. Its amount is the Duck knob on the kick page (full out of the box). The snare
+plays without ducking; to give it some, set `snare_amt` in `blas_dsp.h`.
 
-**Ghost triggers.** A trigger ducks whether or not its drum is audible. Turn Kick Level to zero and
+**Ghost triggers.** A kick trigger ducks whether or not the kick is audible. Turn Kick Level to zero and
 J3 becomes a plain side-chain trigger for a kick that lives elsewhere.
 
 ## Duck types
@@ -103,13 +102,13 @@ J3 becomes a plain side-chain trigger for a kick that lives elsewhere.
 |---|---|---|
 | **Volume** | The whole signal. | The classic pump. |
 | **Split** | Only the band below the Focus crossover. Everything above passes untouched. | Making room for the kick while hats, pads and vocals stay put. |
-| **Carve** | A dynamic EQ cut around each drum: just above the kick's tuning for kick triggers, just above the snare's tuning for snare triggers. Depth sets how deep (up to 36 dB), Width how wide. | The most transparent option. The cuts follow the Tune knobs and their CV. |
+| **Carve** | A dynamic EQ cut just above the kick's tuning. Depth sets how deep (up to 36 dB), Width how wide. | The most transparent option. The cut follows Kick Tune and its CV. |
 
 Switching type crossfades over about 12 ms, so you can do it live or from CV.
 
 ## Triggers (J3, J4)
 
-A rising edge above 1.5 V fires the drum and its duck envelope.
+A rising edge above 1.5 V fires the drum. A kick trigger also fires the duck envelope.
 
 With **Trigger accent** on (the default), the trigger's voltage sets how hard the drum hits: 1.5 V
 is a soft hit, 4.5 V and above is full level. Reading the height adds one audio block (0.5 ms).
@@ -120,14 +119,16 @@ Turn accent off in Settings and every hit is full level with no added delay.
 **J5** can move any ducker knob, **J6** any kick knob, **J7** any snare knob: the two on the main
 page and the six on the row's options page. Every knob has its own depth, set like an attenuverter:
 
-- **Hold the row's button and turn the knob you want the CV to move.** The first knob you turn is
-  the one you are setting. Noon = off, right = positive, left = inverted. While you hold, the ring
-  shows the depth: white for positive, cyan for inverted.
+- **Hold the row's button and turn the knob you want the CV to move.** B1 for duck knobs (J5), B2
+  for kick knobs (J6), B3 for snare knobs (J7). The first knob you turn is the one you are setting.
+  Noon = off, right = positive, left = inverted. While you hold, the ring shows the depth: white
+  for positive, cyan for inverted.
+- **On the main page** a button reaches its own row's two knobs. **On a row's options page** that
+  row's button reaches all six: on the Kick page, hold B2 and turn any knob to set how much J6
+  moves it. The other two buttons set nothing there.
 - **Hold without turning** and after a moment the row's rings show their current depths.
 - **Release.** The knob goes back to its normal job, but its value stays where it was until you turn
   the knob back to it, so setting a depth never makes the sound jump.
-- On the main page a button reaches its own row's two knobs. On an options page its button reaches
-  all six.
 - **Depth range:** at full depth, ±5 V moves the knob half its travel. The rings follow the
   modulated position.
 - Unpatched jacks contribute nothing, and depths default to off.
@@ -149,17 +150,20 @@ J8 puts out the duck envelope, to pump other modules. Three modes, chosen in Set
 
 Hold **B2 + B3** for two seconds. **B1** steps through the pages; **B2** or **B3** leaves.
 
-| Page | P1 | P2 | P3 | P4 | P5 |
-|---|---|---|---|---|---|
-| 1 Setup | LED brightness | Trigger accent (off / on) | Preset slot | Preset save / load | J8 envelope (dip / bump / full) |
+| Page | P1 | P2 | P3 | P4 | P5 | P6 |
+|---|---|---|---|---|---|---|
+| 1 Setup | LED brightness | Trigger accent (off / on) | Preset slot | Preset save / load | J8 envelope (dip / bump / full) | Reverb on (snare / kick + snare) |
 
 Pages 2 to 5 hold the **CV depths**, one page per knob page (main, duck, kick, snare), with each
 depth on the same knob as the control it belongs to. These are the same values the hold-and-turn
-gesture sets, so use whichever is handier.
+gesture sets, so use whichever is handier. A depth starts at noon (off), and like every knob in the
+menu it only starts moving once you turn the knob through noon.
 
 ## Presets and power-on
 
-Everything above (all 24 knobs, the CV depths and the Setup options) is saved in a preset.
+Everything above (all 24 knobs, the CV depths and the Setup options) is saved in a preset. Presets
+saved by v0.1.0 are not carried over. v0.2.0 presets load, but the snare's Bend and Reverb
+knobs will need resetting.
 
 - Blas **remembers its state by itself**: three seconds after the last change it writes the current
   state to the first preset slot, which is the one loaded at power-on.
@@ -194,7 +198,7 @@ make test            # host-side checks, no hardware needed
 ```
 
 If Athanor's `lib/` is already set up next door, `ln -s ../athanor/lib lib` saves the download.
-`blas.bin` in this folder is a ready-built copy of v0.1.0.
+`blas.bin` in this folder is a ready-built copy of v0.3.2.
 
 `lib/` is ignored by git. To track the SDK and libDaisy as submodules, as Athanor does, remove
 `lib/` from `.gitignore` and add them with `git submodule add`.

@@ -248,6 +248,133 @@ float Snare::Tick()
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
+ *  Reverb
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+void Reverb::Init(float sr, float* mem)
+{
+    sr_ = sr;
+    /* Mutually prime line lengths, 30 .. 80 ms at 48 kHz: long enough that
+     * their modes are closely spaced (short lines are what ring). */
+    static const int kLineLen[kLines] = {1423, 1669, 1933, 2251, 2647, 2969, 3371, 3823};
+    static const int kApLen[kNumAp]   = {173, 229, 449, 613};
+    const float scale = sr / 48000.0f;
+
+    for (int i = 0; i < kLines; i++)
+    {
+        line_[i] = mem + i * kMaxLine;
+        int n = static_cast<int>(static_cast<float>(kLineLen[i]) * scale);
+        len_[i] = n < 16 ? 16 : (n > kMaxLine - 64 ? kMaxLine - 64 : n);
+        lp_[i]  = 0.0f;
+        for (int k = 0; k < kMaxLine; k++) line_[i][k] = 0.0f;
+    }
+    for (int i = 0; i < kNumAp; i++)
+    {
+        ap_[i] = mem + kLines * kMaxLine + i * kMaxAp;
+        int n = static_cast<int>(static_cast<float>(kApLen[i]) * scale);
+        ap_len_[i] = n < 4 ? 4 : (n > kMaxAp ? kMaxAp : n);
+        ap_pos_[i] = 0;
+        for (int k = 0; k < kMaxAp; k++) ap_[i][k] = 0.0f;
+    }
+    w_       = 0;
+    hp_      = 0.0f;
+    in_lp_   = 0.0f;
+    hp_a_    = 1.0f - std::exp(-2.0f * kPi * 160.0f / sr);    /* keep the lows out    */
+    in_lp_a_ = 1.0f - std::exp(-2.0f * kPi * 7000.0f / sr);   /* no fizz going in     */
+    damp_a_  = 1.0f - std::exp(-2.0f * kPi * 4200.0f / sr);   /* highs die first      */
+    lfo_       = 0.0f;
+    lfo_inc_   = 0.37f / sr;                                  /* one drift per ~2.7 s */
+    mod_depth_ = 9.0f * scale;                                /* +-9 samples          */
+    wet_ = wet_target_ = 0.0f;
+    Set(0.0f);
+}
+
+float Reverb::DecaySeconds(float amount)
+{
+    /* 0.3 s .. 3.5 s, evenly in ratio so the whole turn is useful. */
+    return 0.3f * std::pow(3.5f / 0.3f, Clamp(amount, 0.0f, 1.0f));
+}
+
+void Reverb::Set(float amount)
+{
+    const float a = Clamp(amount, 0.0f, 1.0f);
+    /* Level rises quickly at first, then the lengthening tail takes over. */
+    wet_target_ = 1.8f * a * (1.6f - 0.6f * a);
+    const float rt60 = DecaySeconds(a);
+    for (int i = 0; i < kLines; i++)
+        g_[i] = std::pow(10.0f, -3.0f * static_cast<float>(len_[i]) / (rt60 * sr_));
+}
+
+void Reverb::Tick(float in, float& out_l, float& out_r)
+{
+    constexpr int kMask = kMaxLine - 1;
+    wet_ += 0.001f * (wet_target_ - wet_);
+
+    hp_    += hp_a_ * (in - hp_);
+    in_lp_ += in_lp_a_ * ((in - hp_) - in_lp_);
+    float x = in_lp_;
+
+    /* Diffusion: smear the hit before it reaches the room. */
+    for (int i = 0; i < kNumAp; i++)
+    {
+        const float buf = ap_[i][ap_pos_[i]];
+        const float y   = buf - 0.62f * x;
+        ap_[i][ap_pos_[i]] = x + 0.62f * y;
+        if (++ap_pos_[i] >= ap_len_[i]) ap_pos_[i] = 0;
+        x = y;
+    }
+
+    lfo_ += lfo_inc_;
+    if (lfo_ >= 1.0f) lfo_ -= 1.0f;
+    const float tri = 4.0f * std::fabs(lfo_ - 0.5f) - 1.0f;       /* -1 .. +1 */
+
+    float d[kLines];
+    for (int i = 0; i < kLines; i++)
+    {
+        float v;
+        if (i == 1 || i == 6)
+        {
+            /* Two lines drift in opposite directions (interpolated read). */
+            const float delay = static_cast<float>(len_[i])
+                              + (i == 1 ? tri : -tri) * mod_depth_;
+            float rp = static_cast<float>(w_) - delay;
+            if (rp < 0.0f) rp += static_cast<float>(kMaxLine);
+            const int   i0 = static_cast<int>(rp);
+            const float fr = rp - static_cast<float>(i0);
+            const float a  = line_[i][i0 & kMask];
+            const float b  = line_[i][(i0 + 1) & kMask];
+            v = a + fr * (b - a);
+        }
+        else
+        {
+            v = line_[i][(w_ - len_[i]) & kMask];
+        }
+        lp_[i] += damp_a_ * (v - lp_[i]);
+        if (lp_[i] < 1.0e-18f && lp_[i] > -1.0e-18f) lp_[i] = 0.0f;
+        d[i] = lp_[i] * g_[i];
+    }
+
+    /* Hadamard mixing: every line feeds every other, equally. */
+    float h[kLines];
+    {
+        const float a0 = d[0] + d[1], a1 = d[0] - d[1], a2 = d[2] + d[3], a3 = d[2] - d[3];
+        const float a4 = d[4] + d[5], a5 = d[4] - d[5], a6 = d[6] + d[7], a7 = d[6] - d[7];
+        const float b0 = a0 + a2, b1 = a1 + a3, b2 = a0 - a2, b3 = a1 - a3;
+        const float b4 = a4 + a6, b5 = a5 + a7, b6 = a4 - a6, b7 = a5 - a7;
+        h[0] = b0 + b4; h[1] = b1 + b5; h[2] = b2 + b6; h[3] = b3 + b7;
+        h[4] = b0 - b4; h[5] = b1 - b5; h[6] = b2 - b6; h[7] = b3 - b7;
+    }
+    constexpr float kNorm = 0.35355339f;      /* 1 / sqrt(8) */
+    const float xin = x * 0.35f;
+    for (int i = 0; i < kLines; i++)
+        line_[i][w_] = ((i & 1) ? -xin : xin) + h[i] * kNorm;
+    w_ = (w_ + 1) & kMask;
+
+    out_l = (d[0] - d[2] + d[4] - d[6]) * 0.5f * wet_;
+    out_r = (d[1] - d[3] + d[5] - d[7]) * 0.5f * wet_;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
  *  Duck envelope
  * ═════════════════════════════════════════════════════════════════════════ */
 
@@ -292,11 +419,12 @@ float DuckEnv::Advance(float dt, float attack_s, float hold_s, float release_s, 
  *  Engine
  * ═════════════════════════════════════════════════════════════════════════ */
 
-void Engine::Init(float sample_rate)
+void Engine::Init(float sample_rate, float* reverb_mem)
 {
     sr_ = sample_rate;
     kick_.Init(sr_);
     snare_.Init(sr_);
+    reverb_.Init(sr_, reverb_mem);
     env_k_.Reset();
     env_s_.Reset();
     for (int c = 0; c < 2; c++)
@@ -319,6 +447,7 @@ void Engine::Set(const Params& p)
     if (p_.duck.type >= kDuckTypeCount) p_.duck.type = kDuckTypeCount - 1;
     kick_.Set(p_.kick);
     snare_.Set(p_.snare);
+    reverb_.Set(p_.reverb.amount);
     UpdateFilters();
 }
 
@@ -377,6 +506,7 @@ void Engine::Process(const float* in_l, const float* in_r,
     const float depth   = Clamp(d.depth, 0.0f, 1.0f);
     const float amt_k   = Clamp(d.kick_amt, 0.0f, 1.0f);
     const float amt_s   = Clamp(d.snare_amt, 0.0f, 1.0f);
+    const float rev_kick = p_.reverb.kick ? 0.6f : 0.0f;
 
     size_t done = 0;
     while (done < n)
@@ -436,7 +566,11 @@ void Engine::Process(const float* in_l, const float* in_r,
             w1 += w_step[1];
             w2 += w_step[2];
 
-            const float drums = kick_.Tick() + snare_.Tick();
+            const float kick  = kick_.Tick();
+            const float snare = snare_.Tick();
+            const float drums = kick + snare;
+            float rev_l, rev_r;
+            reverb_.Tick(snare + kick * rev_kick, rev_l, rev_r);
             const float x[2]  = {in_l[done + i], in_r[done + i]};
             float       y[2];
 
@@ -462,8 +596,8 @@ void Engine::Process(const float* in_l, const float* in_r,
                 y[c] = w0 * (x[c] * g) + w1 * (low * g + high) + w2 * carve;
             }
 
-            out_l[done + i] = SoftClip(y[0] + drums);
-            out_r[done + i] = SoftClip(y[1] + drums);
+            out_l[done + i] = SoftClip(y[0] + drums + rev_l);
+            out_r[done + i] = SoftClip(y[1] + drums + rev_r);
         }
 
         gain_ = g_target;

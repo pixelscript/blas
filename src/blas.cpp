@@ -18,7 +18,9 @@
  *   Tap a row's button      open that row's six-knob options page
  *                           (tap again to return)
  *   Hold it + turn a knob   set how much the row's CV jack moves that knob
- *                           (noon = off, right = positive, left = inverted)
+ *                           (noon = off, right = positive, left = inverted).
+ *                           Main page: the row's two knobs. On the row's
+ *                           own options page: any of the six.
  *
  * Built on the Alchemy SDK framework: Pager (pages, pot-catch), Settings
  * (the CV depths live there, so they are also editable from the Settings
@@ -49,6 +51,7 @@
 #include "blas_dsp.h"
 #include "blas_surface.h"
 #include "hold_pager.h"
+#include "row_gestures.h"
 
 #ifndef BLAS_VERSION
 #define BLAS_VERSION "0.0.0"
@@ -64,9 +67,7 @@ static constexpr float kTrigHiV = 1.5f;
 static constexpr float kTrigLoV = 0.8f;
 
 /* Gestures. */
-static constexpr uint32_t kTapMs       = 400u;    /* longer presses are holds  */
-static constexpr uint32_t kPeekMs      = 250u;    /* hold: show the CV depths  */
-static constexpr float    kClaimTravel = 0.02f;   /* pot travel that claims    */
+static constexpr uint32_t kPeekMs = 250u;    /* hold: show the CV depths */
 
 /* ═════════════════════════════════════════════════════════════════════════
  *  Meters (written by the audio callback, read by the LEDs)
@@ -110,6 +111,9 @@ static hostlink::Gauge<float>   g_gain("duck.gain", "Duck gain");
 static hostlink::Gauge<float>   g_cpu("cpu.load", "CPU load");
 
 static blas::Engine engine;
+/* Reverb delay lines live in external SDRAM (too big for the fast internal
+ * RAM the rest of the engine uses). Cleared by engine.Init(). */
+static float DSY_SDRAM_BSS reverb_mem[blas::Reverb::kMemFloats];
 
 /* ═════════════════════════════════════════════════════════════════════════
  *  Audio
@@ -143,6 +147,7 @@ static volatile float midi_snare_vel = 0.0f;
 
 static volatile bool    accent_on = true;
 static volatile uint8_t env_mode  = kEnvDip;
+static volatile bool    reverb_kick = false;
 
 static float    row_cv_lp[kNumRows] = {};
 static uint32_t cpu_ticks_max       = 0;      /* worst block since last read */
@@ -192,7 +197,6 @@ static void ReadParams(blas::Params& p)
     p.duck.focus     = k_focus.Norm();
     p.duck.width     = k_width.Norm();
     p.duck.kick_amt  = k_kick_duck.Norm();
-    p.duck.snare_amt = k_snare_duck.Norm();
 
     p.kick.level   = k_kick_level.Norm();
     p.kick.tune_hz = k_kick_tune.Value();
@@ -208,6 +212,8 @@ static void ReadParams(blas::Params& p)
     p.snare.snappy  = k_snare_snappy.Norm();
     p.snare.tone    = k_snare_tone.Norm();
     p.snare.bend    = k_snare_bend.Norm();
+    p.reverb.amount = k_reverb.Norm();
+    p.reverb.kick   = reverb_kick;
     p.snare.drive   = k_snare_drive.Norm();
 }
 
@@ -275,43 +281,8 @@ static void AudioCallback(daisy::AudioHandle::InputBuffer  in,
  *  Buttons: tap = options page, hold + turn = CV depth
  * ═════════════════════════════════════════════════════════════════════════ */
 
-struct BtnState
-{
-    bool     prev     = false;
-    bool     poisoned = false;   /* this press does nothing until released */
-    uint32_t down_ms  = 0;
-};
-static BtnState btn[kNumButtons];
-
-static int8_t   held_row     = -1;    /* row button owning the current hold */
-static int8_t   claimed_pot  = -1;    /* the knob whose depth is being set  */
-static uint32_t held_since   = 0;
-static float    press_phys[kNumPots] = {};
-static float    last_written = -1.0f;
-static volatile int8_t nav_request = -1;   /* tapped row, applied next frame */
-static uint32_t now_ms = 0;
-
-static inline bool Eligible(uint8_t page, int row, uint8_t pot)
-{
-    return row >= 0 && RowOf(page, pot) == row;
-}
-
-static void BeginHold(uint8_t row, uint32_t t_ms)
-{
-    held_row     = static_cast<int8_t>(row);
-    claimed_pot  = -1;
-    held_since   = t_ms;
-    last_written = -1.0f;
-    std::memcpy(press_phys, loop.Phys(), sizeof(press_phys));
-    pager.Freeze(loop.Phys());
-}
-
-static void EndHold()
-{
-    held_row    = -1;
-    claimed_pot = -1;
-    pager.Thaw();
-}
+static RowGestures gestures;
+static uint32_t    now_ms = 0;
 
 /* ── USB MIDI: notes fire the drums ───────────────────────────────────── */
 static midi::DaisyUsbPort<> midi_port;
@@ -338,53 +309,9 @@ static void OnPoll(uint32_t t_ms)
     if (midi_time.Initialized()) midi_time.Update(daisy::System::GetTick());
     if (midi_ready) midi_port.Poll(midi_time.GetSample(), OnMidiEvent);
 
-    const bool gated = settings.IsActive();
-
-    bool    down[kNumButtons];
-    uint8_t num_down = 0;
-    for (uint8_t i = 0; i < kNumButtons; i++)
-    {
-        down[i] = hw.buttons[i].Pressed();
-        if (down[i]) num_down++;
-    }
-
-    for (uint8_t i = 0; i < kNumButtons; i++)
-    {
-        BtnState& b = btn[i];
-        const bool rising  = down[i] && !b.prev;
-        const bool falling = !down[i] && b.prev;
-        b.prev = down[i];
-
-        if (rising)
-        {
-            b.down_ms  = t_ms;
-            b.poisoned = gated;
-            if (num_down > 1)
-            {
-                /* Two buttons is the Settings chord (B2+B3), never ours. */
-                for (uint8_t j = 0; j < kNumButtons; j++)
-                    if (down[j]) btn[j].poisoned = true;
-                if (held_row >= 0) EndHold();
-            }
-            else if (!gated)
-            {
-                BeginHold(i, t_ms);
-            }
-        }
-
-        if (falling)
-        {
-            if (held_row == static_cast<int8_t>(i) && !b.poisoned)
-            {
-                const bool tap = claimed_pot < 0 && (t_ms - b.down_ms) < kTapMs;
-                EndHold();
-                if (tap) nav_request = static_cast<int8_t>(i);
-            }
-            b.poisoned = false;
-        }
-    }
-
-    if (gated && held_row >= 0) EndHold();
+    bool down[kNumRows];
+    for (uint8_t i = 0; i < kNumRows; i++) down[i] = hw.buttons[i].Pressed();
+    gestures.Poll(down, settings.IsActive(), t_ms, loop.Phys(), pager);
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
@@ -393,9 +320,6 @@ static void OnPoll(uint32_t t_ms)
 
 static void WriteDepth(uint8_t page, uint8_t pot, float pot_norm)
 {
-    if (last_written >= 0.0f && std::fabs(pot_norm - last_written) < 0.002f) return;
-    last_written = pot_norm;
-    pot_norm = pot_norm < 0.0f ? 0.0f : (pot_norm > 1.0f ? 1.0f : pot_norm);
     /* The Settings control stores the pot position (noon = 0); writing it
      * through the settings path keeps the menu, presets and web editor in
      * step with the gesture. */
@@ -430,7 +354,7 @@ static void Autosave(uint32_t t_ms)
 
     const uint32_t h = LiveHash();
     if (h != state_hash) { state_hash = h; state_since = t_ms; return; }
-    if (h == saved_hash || held_row >= 0) return;
+    if (h == saved_hash || gestures.HeldRow() >= 0) return;
     if (t_ms - state_since < kAutosaveQuietMs) return;
     /* The preset area is shared with other Alchemy firmwares. If the first
      * slot holds another firmware's preset, leave it alone: saving a Blas
@@ -445,38 +369,22 @@ static void OnFrame()
 {
     const float* phys = loop.Phys();
 
+    const RowGestures::Actions act = gestures.Frame(phys, pager.Page());
+
     /* Tap: toggle between the main page and the tapped row's options. */
-    const int8_t nav = nav_request;
-    if (nav >= 0)
+    if (act.nav_row >= 0)
     {
-        nav_request = -1;
-        const uint8_t target = static_cast<uint8_t>(1 + nav);
+        const uint8_t target = static_cast<uint8_t>(1 + act.nav_row);
         pager.GoToPage(pager.Page() == target ? kPageMain : target, phys);
     }
-
-    /* Hold: the first knob of that row to move is the one being set. */
-    if (held_row >= 0)
-    {
-        const uint8_t page = pager.Page();
-        if (claimed_pot < 0)
-        {
-            for (uint8_t p = 0; p < kNumPots; p++)
-            {
-                if (!Eligible(page, held_row, p)) continue;
-                if (std::fabs(phys[p] - press_phys[p]) > kClaimTravel)
-                {
-                    claimed_pot = static_cast<int8_t>(p);
-                    break;
-                }
-            }
-        }
-        if (claimed_pot >= 0)
-            WriteDepth(page, static_cast<uint8_t>(claimed_pot), phys[claimed_pot]);
-    }
+    /* Hold + turn: the knob's position becomes its CV depth. */
+    if (act.depth_pot >= 0)
+        WriteDepth(pager.Page(), static_cast<uint8_t>(act.depth_pot), act.depth_pos);
 
     /* Settings that the audio callback reads. */
     accent_on = refs.accent.Value() != 0u;
     env_mode  = refs.env.Value();
+    reverb_kick = refs.reverb.Value() != 0u;
 
     Autosave(now_ms);
 
@@ -512,7 +420,9 @@ static void OnRender(uint32_t t_ms)
 {
     if (settings.IsActive()) return;
 
-    const uint8_t page = pager.Page();
+    const uint8_t page        = pager.Page();
+    const int8_t  held_row    = gestures.HeldRow();
+    const int8_t  claimed_pot = gestures.ClaimedPot();
 
     /* Buttons: each wears its row's colour; the open page's button is
      * bright. B1 dims with the ducking; B2 and B3 flash on their drum. */
@@ -541,10 +451,10 @@ static void OnRender(uint32_t t_ms)
      * positive, cyan = inverted, from noon); the one being set is bright. */
     if (held_row >= 0)
     {
-        const bool peek = (t_ms - held_since) >= kPeekMs;
+        const bool peek = (t_ms - gestures.HeldSince()) >= kPeekMs;
         for (uint8_t p = 0; p < kNumPots; p++)
         {
-            if (!Eligible(page, held_row, p)) continue;
+            if (RowOf(page, p) != held_row) continue;
             const bool mine = (claimed_pot == static_cast<int8_t>(p));
             if (!mine && (!peek || claimed_pot >= 0)) continue;
             DrawDepthRing(p, row_cv.Depth(page, p), mine);
@@ -608,14 +518,14 @@ static void SeedDefaults()
     Seed(kPageSnare, k_snare_tone,   d.snare.tone * 100.f);
     Seed(kPageSnare, k_snare_bend,   d.snare.bend * 100.f);
     Seed(kPageSnare, k_snare_drive,  d.snare.drive * 100.f);
-    Seed(kPageSnare, k_snare_duck,   d.duck.snare_amt * 100.f);
+    Seed(kPageSnare, k_reverb,       d.reverb.amount * 100.f);
 }
 
 int main()
 {
     hw.Init();
     const float sr = hw.SampleRate();
-    engine.Init(sr);
+    engine.Init(sr, reverb_mem);
 
     /* J8 is the envelope output; J3..J7 stay inputs. */
     hw.j8.EnableCvOutput();

@@ -139,9 +139,9 @@ inline VirtualKnob k_snare_bend = VirtualKnob(kPotMiddleRight, "Snare Bend")
 inline VirtualKnob k_snare_drive = VirtualKnob(kPotBottomLeft, "Snare Drive")
     .Linear(0.f, 100.f).Unit("%").Ident("snare.drive")
     .Ring(Level(kRowColor[kRowSnare]));
-inline VirtualKnob k_snare_duck = VirtualKnob(kPotBottomRight, "Snare Duck")
-    .Linear(0.f, 100.f).Unit("%").Ident("snare.duck")
-    .Ring(Level(kRowColor[kRowDuck]));
+inline VirtualKnob k_reverb = VirtualKnob(kPotBottomRight, "Reverb")
+    .Linear(0.f, 100.f).Unit("%").Ident("snare.reverb")
+    .Ring(Level(kWhite));
 
 inline Page page_main = Page(kPageMain).Name("Blas").Color("#ffffff")
     .Knobs(k_depth, k_release, k_kick_level, k_kick_tune, k_snare_level, k_snare_tune);
@@ -150,7 +150,7 @@ inline Page page_duck = Page(kPageDuck).Name("Duck").Color(kRowColor[kRowDuck])
 inline Page page_kick = Page(kPageKick).Name("Kick").Color(kRowColor[kRowKick])
     .Knobs(k_kick_decay, k_kick_bend, k_kick_punch, k_kick_click, k_kick_drive, k_kick_duck);
 inline Page page_snare = Page(kPageSnare).Name("Snare").Color(kRowColor[kRowSnare])
-    .Knobs(k_snare_decay, k_snare_snappy, k_snare_tone, k_snare_bend, k_snare_drive, k_snare_duck);
+    .Knobs(k_snare_decay, k_snare_snappy, k_snare_tone, k_snare_bend, k_snare_drive, k_reverb);
 
 /* ═════════════════════════════════════════════════════════════════════════
  *  Row CV: one jack per row, a depth per knob
@@ -159,6 +159,10 @@ inline Page page_snare = Page(kPageSnare).Name("Snare").Color(kRowColor[kRowSnar
  *  on the main page plus the six on the row's options page. Each knob has
  *  its own depth (an attenuverter, -1..+1). At full depth +-5 V moves the
  *  knob half its travel.
+ *
+ *  The button to hold is the knob's own row button (RowOf): B1 for duck
+ *  knobs, B2 for kick knobs, B3 for snare knobs. On a row's options page
+ *  that one button therefore reaches all six knobs.
  *
  *  The depths are Settings controls, so they persist, appear in the
  *  Settings menu and the web editor, and the hold-and-turn gesture simply
@@ -224,13 +228,14 @@ inline const CvSlotName kCvSlots[kNumAppPages][kNumPots] = {
      {"cv.kick.drive", "J6 > Drive"},        {"cv.kick.duck", "J6 > Duck"}},
     {{"cv.snare.decay", "J7 > Decay"},       {"cv.snare.snappy", "J7 > Snappy"},
      {"cv.snare.tone", "J7 > Tone"},         {"cv.snare.bend", "J7 > Bend"},
-     {"cv.snare.drive", "J7 > Drive"},       {"cv.snare.duck", "J7 > Duck"}},
+     {"cv.snare.drive", "J7 > Drive"},       {"cv.snare.reverb", "J7 > Reverb"}},
 };
 inline const char* const kCvPageNames[kNumAppPages] = {
     "CV: Main", "CV: Duck (J5)", "CV: Kick (J6)", "CV: Snare (J7)"};
 
 inline const char* const kOffOn[2]    = {"Off", "On"};
 inline const char* const kEnvModes[3] = {"Dip", "Bump", "Full"};
+inline const char* const kReverbOn[2] = {"Snare", "Kick + Snare"};
 enum : uint8_t { kEnvDip = 0, kEnvBump, kEnvFull };
 
 /* Jack labels for the web editor. */
@@ -252,6 +257,7 @@ struct SettingsRefs
 {
     SelectorHandle accent;   /* trigger height sets the hit's level */
     SelectorHandle env;      /* what J8 puts out                    */
+    SelectorHandle reverb;   /* which drums feed the reverb         */
     uint16_t       cv_offset[kNumAppPages][kNumPots] = {};   /* blob offsets */
 };
 
@@ -269,6 +275,9 @@ inline void DeclareSettings(Settings& settings, Presets& presets, RowCv& row_cv,
         .Default(kEnvDip).Ident("env.mode").Name("J8 envelope")
         .Help("Dip: 5 V at rest, falling by the Depth amount. Bump: 0 V at rest, "
               "rising by the Depth amount. Full: 0 to 5 V whatever Depth is set to.");
+    refs.reverb = settings.Page(0).Pot(kPotBottomRight).Selector(kReverbOn)
+        .Default(0).Ident("rev.source").Name("Reverb on")
+        .Help("Which drums the Reverb knob (snare page, P6) sends to the reverb.");
     settings.Page(0).Name("Setup");
 
     /* Pages 2-5: CV depth for every knob, laid out like the knob pages. */

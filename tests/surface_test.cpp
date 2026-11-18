@@ -25,6 +25,7 @@
 #include "alchemy/surface/settings.h"
 #include "blas_surface.h"
 #include "hold_pager.h"
+#include "row_gestures.h"
 
 using namespace alchemy;
 
@@ -146,6 +147,129 @@ int main()
               "noon detent: small depths read as off, full stays full", ApplyDetent(0.05f));
     }
 
+    std::printf("Button gestures (played through the real pager and settings)\n");
+    {
+        /* A miniature of ControlLoop::Tick: 16 button polls, then the pot
+         * snapshot, CV refresh, pager update and the frame hook. */
+        static RowGestures g;
+        float    pots[kNumPots] = {0.30f, 0.30f, 0.30f, 0.30f, 0.30f, 0.30f};
+        float    phys[kNumPots] = {0.30f, 0.30f, 0.30f, 0.30f, 0.30f, 0.30f};
+        bool     down[kNumRows] = {false, false, false};
+        bool     menu = false;
+        uint32_t t = 100000;
+        auto frame = [&]() {
+            for (int i = 0; i < 16; i++) g.Poll(down, menu, t + i, phys, pager);
+            t += 16;
+            std::memcpy(phys, pots, sizeof phys);
+            row_cv.Update(nullptr, t);
+            if (menu) return;
+            pager.Update(phys, t);
+            const RowGestures::Actions a = g.Frame(phys, pager.Page());
+            if (a.nav_row >= 0)
+            {
+                const uint8_t target = static_cast<uint8_t>(1 + a.nav_row);
+                pager.GoToPage(pager.Page() == target ? kPageMain : target, phys);
+            }
+            if (a.depth_pot >= 0)
+                settings.SetSerializedField(refs.cv_offset[pager.Page()][a.depth_pot],
+                                            reinterpret_cast<const uint8_t*>(&a.depth_pos), 4, phys);
+        };
+        auto frames = [&](int n) { for (int i = 0; i < n; i++) frame(); };
+        auto tap    = [&](int b) { down[b] = true; frames(5); down[b] = false; frames(3); };
+        auto sweep  = [&](int p, float to) {
+            const float from = pots[p];
+            for (int i = 1; i <= 20; i++) { pots[p] = from + (to - from) * (float)i / 20.0f; frame(); }
+        };
+        auto zero_depths = [&]() {
+            float half = 0.5f;
+            for (uint8_t pg = 0; pg < kNumAppPages; pg++)
+                for (uint8_t p = 0; p < kNumPots; p++)
+                    settings.SetSerializedField(refs.cv_offset[pg][p], reinterpret_cast<const uint8_t*>(&half), 4, phys);
+        };
+
+        pager.GoToPage(kPageMain, phys);
+        frames(4);
+        zero_depths();
+
+        /* Main page: hold B1, turn P1. */
+        const float depth_before = pager.Stored(kPageMain, 0);
+        down[kRowDuck] = true; frames(3);
+        sweep(0, 0.90f);
+        Check(g.ClaimedPot() == 0, "main page: holding B1 and turning P1 claims P1", g.ClaimedPot());
+        down[kRowDuck] = false; frames(3);
+        Check(row_cv.Depth(kPageMain, 0) > 0.7f, "main page: its CV depth is set", row_cv.Depth(kPageMain, 0));
+        Check(pager.Stored(kPageMain, 0) == depth_before && pager.Page() == kPageMain,
+              "main page: Depth itself did not move, and no page change", pager.Stored(kPageMain, 0));
+
+        /* A row button does not reach another row's knob on the main page. */
+        down[kRowDuck] = true; frames(3);
+        sweep(2, 0.80f);
+        Check(g.ClaimedPot() < 0 && row_cv.Depth(kPageMain, 2) == 0.0f,
+              "main page: B1 does not set a kick knob's depth", row_cv.Depth(kPageMain, 2));
+        down[kRowDuck] = false; frames(3);
+
+        /* Tap B2: the kick options page. */
+        tap(kRowKick);
+        Check(pager.Page() == kPageKick, "tapping B2 opens the kick page", pager.Page());
+
+        /* Kick page: B2 reaches all six knobs; the other buttons none. */
+        const float decay_before = pager.Stored(kPageKick, 0);
+        down[kRowDuck] = true; frames(30);
+        sweep(0, 0.60f);
+        Check(g.ClaimedPot() < 0 && row_cv.Depth(kPageKick, 0) == 0.0f,
+              "kick page: B1 does not set a kick knob", g.ClaimedPot());
+        down[kRowDuck] = false; frames(3);
+        Check(pager.Page() == kPageKick, "kick page: and a long B1 hold does not change page", pager.Page());
+        down[kRowKick] = true; frames(3);
+        sweep(0, 0.10f);
+        Check(g.ClaimedPot() == 0, "kick page: holding B2 and turning P1 claims P1", g.ClaimedPot());
+        down[kRowKick] = false; frames(3);
+        Check(row_cv.Depth(kPageKick, 0) < -0.7f, "kick page: its CV depth is set (inverted)", row_cv.Depth(kPageKick, 0));
+        Check(pager.Stored(kPageKick, 0) == decay_before && pager.Page() == kPageKick,
+              "kick page: Decay itself did not move, still on the kick page", pager.Stored(kPageKick, 0));
+        row_cv.SetCv(kRowKick, 0.25f);
+        Check(row_cv.DeltaAtPage(kPageKick, 0) < -0.15f, "kick page: +2.5 V on J6 now pulls Decay down",
+              row_cv.DeltaAtPage(kPageKick, 0));
+
+        /* Every knob of every options page, with that page's own button. */
+        int set = 0;
+        for (uint8_t row = 0; row < kNumRows; row++)
+        {
+            const uint8_t page = static_cast<uint8_t>(1 + row);
+            if (pager.Page() != page) tap(row);
+            for (uint8_t p = 0; p < kNumPots; p++)
+            {
+                zero_depths(); frames(1);
+                down[row] = true; frames(3);
+                sweep(p, pots[p] > 0.5f ? 0.05f : 0.95f);
+                down[row] = false; frames(3);
+                if (pager.Page() == page && std::fabs(row_cv.Depth(page, p)) > 0.7f) set++;
+            }
+        }
+        Check(set == 18, "all 18 options-page knobs take a depth from their page's button", set);
+
+        /* Tap again: back to the main page. Tap another row: straight there. */
+        tap(kRowSnare);
+        Check(pager.Page() == kPageMain, "tapping the open page's button returns to the main page", pager.Page());
+        tap(kRowDuck); tap(kRowKick);
+        Check(pager.Page() == kPageKick, "tapping another row's button jumps to that row's page", pager.Page());
+        tap(kRowKick);
+
+        /* A long press with nothing turned does nothing. */
+        down[kRowKick] = true; frames(40); down[kRowKick] = false; frames(3);
+        Check(pager.Page() == kPageMain, "a long press without turning a knob changes nothing", pager.Page());
+
+        /* The Settings chord and the press that closes the menu are not taps. */
+        down[kRowKick] = true; frames(2); down[kRowSnare] = true; frames(130);
+        menu = true; frames(2);
+        down[kRowKick] = false; down[kRowSnare] = false; frames(3);
+        Check(pager.Page() == kPageMain && g.HeldRow() < 0, "B2+B3 (open Settings) is not a tap or a hold", pager.Page());
+        down[kRowKick] = true; g.Poll(down, true, t, phys, pager);
+        menu = false; frames(4);                 /* the menu closes on this press */
+        down[kRowKick] = false; frames(3);
+        Check(pager.Page() == kPageMain, "the press that closes Settings does not open a page", pager.Page());
+    }
+
     std::printf("Web editor descriptor\n");
     {
         presets.Manage(pager);
@@ -170,8 +294,8 @@ int main()
         Check(len < sizeof buf / 2, "and uses under half of the SDK's descriptor buffer (bytes)", len);
         const char* want[] = {
             "\"id\":\"duck.depth\"", "\"id\":\"duck.type\"", "\"Volume\",\"Split\",\"Carve\"",
-            "\"id\":\"kick.punch\"", "\"id\":\"snare.snappy\"", "\"id\":\"cv.kick.tune\"",
-            "\"id\":\"cv.snare.duck\"", "\"id\":\"trig.accent\"", "\"id\":\"env.mode\"",
+            "\"id\":\"kick.punch\"", "\"id\":\"snare.snappy\"", "\"id\":\"snare.reverb\"", "\"id\":\"rev.source\"", "\"id\":\"cv.kick.tune\"",
+            "\"id\":\"cv.snare.reverb\"", "\"id\":\"snare.bend\"", "\"id\":\"trig.accent\"", "\"id\":\"env.mode\"",
             "\"Blas\",\"Duck\",\"Kick\",\"Snare\"", "CV: Kick (J6)", "Duck Envelope Out"};
         int found = 0;
         for (const char* w : want)

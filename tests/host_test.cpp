@@ -5,6 +5,7 @@
  *
  * Each check prints what it measured; any failure exits non-zero.
  */
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -16,6 +17,14 @@ using namespace blas;
 static int   g_fail = 0;
 static const float kSr = 48000.0f;
 static const float kPi = 3.14159265358979f;
+
+/** Fresh, deliberately dirty delay memory for one engine. */
+static float* NewReverbMem()
+{
+    static std::vector<std::vector<float>> pool;
+    pool.emplace_back(Reverb::kMemFloats, 123.0f);
+    return pool.back().data();
+}
 
 static void Check(bool ok, const char* what, double got, const char* unit = "")
 {
@@ -99,7 +108,7 @@ int main()
     /* ── 1. Drums ─────────────────────────────────────────────────────── */
     std::printf("Kick\n");
     {
-        Engine e; e.Init(kSr);
+        Engine e; e.Init(kSr, NewReverbMem());
         Params p; p.duck.depth = 0; p.snare.level = 0;
         p.kick.level = 1.0f; p.kick.tune_hz = 50.0f; p.kick.decay_s = 0.5f;
         Run r = Render(e, p, 0, 0, 2.0f, 480, -1);
@@ -117,13 +126,13 @@ int main()
 
         /* Level and drive stay bounded. */
         p.kick.drive = 1.0f; p.kick.punch = 1.0f; p.kick.click = 1.0f; p.kick.bend = 1.0f;
-        Engine e2; e2.Init(kSr);
+        Engine e2; e2.Init(kSr, NewReverbMem());
         Run r2 = Render(e2, p, 0, 0, 1.0f, 100, -1);
         Check(r2.Finite() && r2.Peak(0, 48000) <= 1.0, "everything at maximum stays within +-1",
               r2.Peak(0, 48000));
 
         /* Rapid retriggers do not blow up or click to full scale. */
-        Engine e3; e3.Init(kSr);
+        Engine e3; e3.Init(kSr, NewReverbMem());
         Run acc;
         for (int k = 0; k < 16; k++)
         {
@@ -137,7 +146,7 @@ int main()
 
     std::printf("Snare\n");
     {
-        Engine e; e.Init(kSr);
+        Engine e; e.Init(kSr, NewReverbMem());
         Params p; p.duck.depth = 0; p.kick.level = 0; p.snare.level = 1.0f;
         Run r = Render(e, p, 0, 0, 1.5f, -1, 480);
         const double pk = r.Peak(480, 48000);
@@ -146,10 +155,10 @@ int main()
         Check(r.Peak(60000, 72000) == 0.0, "returns to exact silence", r.Peak(60000, 72000));
 
         p.snare.snappy = 0.0f;
-        Engine e2; e2.Init(kSr);
+        Engine e2; e2.Init(kSr, NewReverbMem());
         Run body = Render(e2, p, 0, 0, 0.5f, -1, 100);
         p.snare.snappy = 1.0f;
-        Engine e3; e3.Init(kSr);
+        Engine e3; e3.Init(kSr, NewReverbMem());
         Run snap = Render(e3, p, 0, 0, 0.5f, -1, 100);
         /* Snare noise lives in the tail: compare 60-120 ms after the hit. */
         Check(snap.Rms(100 + 2880, 100 + 5760) > 1.5 * body.Rms(100 + 2880, 100 + 5760),
@@ -157,10 +166,112 @@ int main()
               snap.Rms(100 + 2880, 100 + 5760) / std::fmax(body.Rms(100 + 2880, 100 + 5760), 1e-9));
     }
 
+    std::printf("Reverb\n");
+    {
+        Params p; p.duck.depth = 0; p.kick.level = 1.0f; p.snare.level = 1.0f;
+        const size_t hit = 480;
+        auto ms = [&](float t) { return hit + (size_t)(t * 48.0f); };
+
+        Engine dry; dry.Init(kSr, NewReverbMem());
+        Run rd = Render(dry, p, 0, 0, 8.0f, -1, (long)hit);
+
+        /* Three settings: level and decay must both rise with the knob. */
+        const float amounts[3] = {0.2f, 0.5f, 1.0f};
+        Run   r[3];
+        double early[3], rt[3];
+        for (int k = 0; k < 3; k++)
+        {
+            p.reverb.amount = amounts[k];
+            Engine e; e.Init(kSr, NewReverbMem());
+            r[k] = Render(e, p, 0, 0, 8.0f, -1, (long)hit);
+            /* The dry snare is gone by 400 ms, so from there it is all reverb. */
+            early[k] = Db(r[k].Rms(ms(400), ms(450)));
+            /* Measured decay: time for the tail to fall 30 dB from there, doubled. */
+            rt[k] = 0;
+            for (float t = 450; t < 7500; t += 25)
+                if (Db(r[k].Rms(ms(t), ms(t + 50))) < early[k] - 30.0) { rt[k] = 2.0 * (t - 400) / 1000.0; break; }
+        }
+        Check(r[0].Finite() && r[1].Finite() && r[2].Finite(), "output is finite", 1);
+        Check(r[2].Peak(0, r[2].l.size()) <= 1.0, "full reverb stays within +-1", r[2].Peak(0, r[2].l.size()));
+        Check(Db(rd.Rms(ms(400), ms(700))) < -80.0, "no reverb: the snare is gone by 400 ms", Db(rd.Rms(ms(400), ms(700))), "dB");
+        std::printf("       knob 20%% / 50%% / 100%%: level at 400 ms %.1f / %.1f / %.1f dB, measured decay %.2f / %.2f / %.2f s\n",
+                    early[0], early[1], early[2], rt[0], rt[1], rt[2]);
+        Check(early[0] < early[1] && early[1] < early[2], "more knob is louder", early[2] - early[0], "dB");
+        Check(rt[0] > 0 && rt[0] < rt[1] && rt[1] < rt[2], "more knob decays longer (20% vs 100%, s)", rt[2] - rt[0]);
+        for (int k = 0; k < 3; k++)
+        {
+            const double want = Reverb::DecaySeconds(amounts[k]);
+            Check(rt[k] > 0.6 * want && rt[k] < 1.3 * want, "measured decay is close to the intended time (s)", rt[k]);
+        }
+        Check(Db(r[1].Rms(ms(6000), ms(7000))) < -80.0, "50%: silent again after 6 s", Db(r[1].Rms(ms(6000), ms(7000))), "dB");
+
+        double diff = 0;
+        for (size_t i = ms(100); i < ms(400); i++) diff = std::fmax(diff, std::fabs(r[1].l[i] - r[1].r[i]));
+        Check(diff > 1e-3, "the tail is stereo (left and right differ)", diff);
+        double head = 0;
+        for (size_t i = hit; i < hit + 100; i++) head = std::fmax(head, std::fabs(r[1].l[i] - rd.l[i]));
+        Check(head < 1e-3, "the hit itself is unchanged", head);
+
+        /* Not metallic: a ringing reverb piles its tail into a few
+         * resonances. Feed the reverb a single click and compare the
+         * strongest 1/12-octave band of the tail with the typical band
+         * (median), averaged over six time slices, 300 Hz .. 3 kHz.
+         * A smooth room stays within a few dB; a ringing one does not. */
+        for (float amount : {0.15f, 0.3f, 0.6f})
+        {
+            Reverb rv; rv.Init(kSr, NewReverbMem()); rv.Set(amount);
+            const size_t n = 48000;
+            std::vector<float> ir(n);
+            float l, rr;
+            for (size_t i = 0; i < 2000; i++) rv.Tick(0.0f, l, rr);    /* let the level settle */
+            for (size_t i = 0; i < n; i++) { rv.Tick(i == 0 ? 1.0f : 0.0f, l, rr); ir[i] = l; }
+            std::vector<double> mags;
+            const size_t win = 3840, first = 1920;                      /* 80 ms slices from 40 ms */
+            for (double f = 300.0; f < 3000.0; f *= std::pow(2.0, 1.0 / 12.0))
+            {
+                double pw = 0;
+                for (int sl = 0; sl < 6; sl++)
+                {
+                    const size_t a = first + sl * win;
+                    double re = 0, im = 0, en = 0;
+                    for (size_t i = a; i < a + win; i++)
+                    {
+                        const double w = 0.5 - 0.5 * std::cos(2.0 * kPi * (double)(i - a) / (double)win);
+                        const double ph = 2.0 * kPi * f * (double)i / kSr;
+                        re += w * ir[i] * std::cos(ph); im += w * ir[i] * std::sin(ph);
+                        en += (double)ir[i] * ir[i];
+                    }
+                    pw += (re * re + im * im) / (en > 1e-30 ? en : 1e-30);   /* slice-normalised */
+                }
+                mags.push_back(pw);
+            }
+            std::vector<double> sorted = mags;
+            std::sort(sorted.begin(), sorted.end());
+            const double crest = 10.0 * std::log10(sorted.back() / sorted[sorted.size() / 2]);
+            Check(crest < 9.0, "click response: no band rings out above the rest (peak over median)", crest, "dB");
+        }
+
+        /* The kick only reaches the reverb when asked to. */
+        p.reverb.amount = 0.5f; p.reverb.kick = false;
+        Engine k0; k0.Init(kSr, NewReverbMem());
+        Run r0 = Render(k0, p, 0, 0, 1.5f, 480, -1);
+        p.reverb.kick = true;
+        Engine k1; k1.Init(kSr, NewReverbMem());
+        Run r1 = Render(k1, p, 0, 0, 1.5f, 480, -1);
+        double side0 = 0, side1 = 0;
+        for (size_t i = 480; i < r0.l.size(); i++)
+        {
+            side0 = std::fmax(side0, std::fabs(r0.l[i] - r0.r[i]));
+            side1 = std::fmax(side1, std::fabs(r1.l[i] - r1.r[i]));
+        }
+        Check(side0 == 0.0, "snare-only: a kick stays dry and mono", side0);
+        Check(side1 > 1e-3, "kick + snare: the kick gets a tail too", side1);
+    }
+
     /* ── 2. Ducker: Volume ────────────────────────────────────────────── */
     std::printf("Duck: Volume\n");
     {
-        Engine e; e.Init(kSr);
+        Engine e; e.Init(kSr, NewReverbMem());
         Params p = Quiet();
         p.duck.type = kDuckVolume; p.duck.depth = 0.5f; p.duck.kick_amt = 1.0f;
         p.duck.attack_s = 0.002f; p.duck.hold_s = 0.05f; p.duck.release_s = 0.2f;
@@ -174,18 +285,18 @@ int main()
         Check(std::fabs(back) < 0.05, "fully recovered after attack+hold+release", back, "dB");
 
         /* Depth 100% reaches silence; depth 0 does nothing. */
-        Engine e2; e2.Init(kSr);
+        Engine e2; e2.Init(kSr, NewReverbMem());
         p.duck.depth = 1.0f;
         Run r2 = Render(e2, p, 1000, 0.5f, 0.2f, 480, -1);
         Check(Db(r2.Rms(480 + 480, 480 + 1920)) < -80.0, "depth 100% mutes", Db(r2.Rms(480 + 480, 480 + 1920)), "dB");
-        Engine e3; e3.Init(kSr);
+        Engine e3; e3.Init(kSr, NewReverbMem());
         p.duck.depth = 0.0f;
         Run r3 = Render(e3, p, 1000, 0.5f, 0.2f, 480, -1);
         Check(std::fabs(Db(r3.Rms(960, 2400) / (0.5 / std::sqrt(2.0)))) < 0.05, "depth 0 leaves the signal alone",
               Db(r3.Rms(960, 2400) / (0.5 / std::sqrt(2.0))), "dB");
 
         /* Snare amount scales the snare's ducking independently. */
-        Engine e4; e4.Init(kSr);
+        Engine e4; e4.Init(kSr, NewReverbMem());
         p.duck.depth = 0.5f; p.duck.snare_amt = 0.5f;
         Run r4 = Render(e4, p, 1000, 0.5f, 0.2f, -1, 480);
         const double sn = Db(r4.Rms(480 + 480, 480 + 1920) / (0.5 / std::sqrt(2.0)));
@@ -209,18 +320,18 @@ int main()
         double worst = 0;
         for (float f : freqs)
         {
-            Engine e; e.Init(kSr);
+            Engine e; e.Init(kSr, NewReverbMem());
             Run r = Render(e, p, f, 0.5f, 1.0f, -1, -1);
             worst = std::fmax(worst, std::fabs(Db(r.Rms(24000, 48000) / ref)));
         }
         Check(worst < 0.1, "bands sum flat at rest (worst deviation)", worst, "dB");
 
-        Engine lo; lo.Init(kSr);
+        Engine lo; lo.Init(kSr, NewReverbMem());
         Run rl = Render(lo, p, 50, 0.5f, 1.0f, 24000, -1);
         const double low_cut = Db(rl.Rms(24000 + 2400, 24000 + 7200) / ref);
         Check(low_cut < -20.0, "50 Hz is ducked hard", low_cut, "dB");
 
-        Engine hi; hi.Init(kSr);
+        Engine hi; hi.Init(kSr, NewReverbMem());
         Run rh = Render(hi, p, 4000, 0.5f, 1.0f, 24000, -1);
         const double hi_cut = Db(rh.Rms(24000 + 2400, 24000 + 7200) / ref);
         Check(std::fabs(hi_cut) < 0.3, "4 kHz passes untouched", hi_cut, "dB");
@@ -236,28 +347,28 @@ int main()
         p.kick.tune_hz = 50.0f; p.snare.tune_hz = 200.0f; p.duck.snare_amt = 1.0f;
         const double ref = 0.5 / std::sqrt(2.0);
 
-        Engine probe; probe.Init(kSr); probe.Set(p);
+        Engine probe; probe.Init(kSr, NewReverbMem()); probe.Set(p);
         const float fk = probe.KickCarveHz(), fs = probe.SnareCarveHz();
         Check(std::fabs(fk - 70.0f) < 0.5f, "kick cut sits at 1.4x the kick tuning", fk, "Hz");
         Check(std::fabs(fs - 250.0f) < 0.5f, "snare cut sits at 1.25x the snare tuning", fs, "Hz");
 
-        Engine a; a.Init(kSr);
+        Engine a; a.Init(kSr, NewReverbMem());
         Run ra = Render(a, p, fk, 0.5f, 1.0f, 24000, -1);
         const double at_k = Db(ra.Rms(24000 + 4800, 24000 + 12000) / ref);
         Check(std::fabs(at_k + 12.04) < 0.5, "kick trigger cuts 12 dB at the kick centre", at_k, "dB");
         Check(std::fabs(Db(ra.Rms(4800, 24000) / ref)) < 0.05, "flat at rest", Db(ra.Rms(4800, 24000) / ref), "dB");
 
-        Engine b; b.Init(kSr);
+        Engine b; b.Init(kSr, NewReverbMem());
         Run rb = Render(b, p, 5000, 0.5f, 1.0f, 24000, -1);
         const double far = Db(rb.Rms(24000 + 4800, 24000 + 12000) / ref);
         Check(std::fabs(far) < 0.3, "5 kHz is left alone", far, "dB");
 
-        Engine c; c.Init(kSr);
+        Engine c; c.Init(kSr, NewReverbMem());
         Run rc = Render(c, p, fs, 0.5f, 1.0f, -1, 24000);
         const double at_s = Db(rc.Rms(24000 + 4800, 24000 + 12000) / ref);
         Check(std::fabs(at_s + 12.04) < 0.5, "snare trigger cuts 12 dB at the snare centre", at_s, "dB");
 
-        Engine d2; d2.Init(kSr);
+        Engine d2; d2.Init(kSr, NewReverbMem());
         Run rd = Render(d2, p, fs, 0.5f, 1.0f, 24000, -1);
         const double kick_on_snare_band = Db(rd.Rms(24000 + 4800, 24000 + 12000) / ref);
         Check(kick_on_snare_band > -4.0, "kick trigger barely touches the snare band", kick_on_snare_band, "dB");
@@ -268,7 +379,7 @@ int main()
     {
         /* Switching type on a steady tone must not click: the largest
          * sample-to-sample jump stays close to the tone's own slope. */
-        Engine e; e.Init(kSr);
+        Engine e; e.Init(kSr, NewReverbMem());
         Params p = Quiet(); p.duck.depth = 0.5f;
         std::vector<float> all;
         for (int k = 0; k < 9; k++)
@@ -285,7 +396,7 @@ int main()
               max_step / tone_step);
 
         /* Wild parameters and odd block sizes stay finite and bounded. */
-        Engine w; w.Init(kSr);
+        Engine w; w.Init(kSr, NewReverbMem());
         Params q;
         q.kick.tune_hz = 5000; q.kick.decay_s = 0; q.kick.drive = 9; q.kick.level = 3;
         q.snare.tune_hz = -4; q.snare.decay_s = 100; q.snare.tone = 7;

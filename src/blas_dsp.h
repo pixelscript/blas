@@ -9,9 +9,11 @@
  *
  *   in ──► ducker (Volume | Split | Carve) ──►(+)──► soft clip ──► out
  *                                              ▲
- *                     kick + snare (mono) ─────┘
+ *       kick + snare (mono) ──┬────────────────┤
+ *                             └─► reverb (stereo, snare or both)
  *
- * The drums are added after the ducker, so they are never ducked.
+ * The drums and their reverb are added after the ducker, so they are
+ * never ducked.
  * Each drum trigger also fires that drum's own duck envelope.
  */
 #pragma once
@@ -64,14 +66,21 @@ struct DuckParams
     float focus     = 0.50f;   /* Split: crossover. Carve: shift around tuning */
     float width     = 0.60f;   /* Carve: width of the cut (0 narrow, 1 wide)  */
     float kick_amt  = 1.00f;   /* 0..1 how much a kick trigger ducks          */
-    float snare_amt = 0.40f;   /* 0..1 how much a snare trigger ducks         */
+    float snare_amt = 0.00f;   /* 0..1 how much a snare trigger ducks (fixed, no knob) */
+};
+
+struct ReverbParams
+{
+    float amount = 0.0f;      /* 0..1: more is louder and longer (0.3 s .. 3.5 s) */
+    bool  kick   = false;     /* false: snare only. true: the kick is sent too  */
 };
 
 struct Params
 {
-    KickParams  kick;
-    SnareParams snare;
-    DuckParams  duck;
+    KickParams   kick;
+    SnareParams  snare;
+    DuckParams   duck;
+    ReverbParams reverb;
 };
 
 /* ── Building blocks ───────────────────────────────────────────────────── */
@@ -189,12 +198,57 @@ struct Svf
     void Reset() { ic1 = ic2 = 0.0f; }
 };
 
+/**
+ * Room reverb for the drums: mono in, stereo out, wet only.
+ *
+ * Four all-pass diffusers feed an eight-line feedback network (Hadamard
+ * mixing, 30..80 ms lines). Dense from the first few milliseconds, darker
+ * as it decays, and two of the lines drift slowly so no single resonance
+ * can ring: a room rather than a spring or a tin can.
+ *
+ * One control. Turning it up raises the level and lengthens the decay
+ * together, from a small tight room (0.3 s) to a hall (3.5 s).
+ */
+class Reverb
+{
+  public:
+    static constexpr int kLines   = 8;
+    static constexpr int kMaxLine = 4096;    /* 85 ms at 48 kHz; power of two */
+    static constexpr int kNumAp   = 4;
+    static constexpr int kMaxAp   = 1024;
+    /** Floats of delay memory the caller must provide to Init(). */
+    static constexpr size_t kMemFloats = kLines * kMaxLine + kNumAp * kMaxAp;
+
+    /** @p mem holds kMemFloats floats and outlives the reverb. It may be
+     *  uninitialised (e.g. external SDRAM); Init clears it. */
+    void Init(float sr, float* mem);
+    void Set(float amount);
+    void Tick(float in, float& out_l, float& out_r);
+
+    /** Decay time (60 dB) for a given amount, in seconds. */
+    static float DecaySeconds(float amount);
+
+  private:
+    float  sr_ = 48000.0f;
+    float* line_[kLines] = {};
+    int    len_[kLines] = {};
+    int    w_ = 0;                            /* shared write index */
+    float  lp_[kLines] = {}, g_[kLines] = {};
+    float* ap_[kNumAp] = {};
+    int    ap_len_[kNumAp] = {}, ap_pos_[kNumAp] = {};
+    float  hp_ = 0.0f, hp_a_ = 0.0f, in_lp_ = 0.0f, in_lp_a_ = 1.0f, damp_a_ = 0.5f;
+    float  lfo_ = 0.0f, lfo_inc_ = 0.0f, mod_depth_ = 0.0f;
+    float  wet_ = 0.0f, wet_target_ = 0.0f;
+};
+
 /* ── Engine ────────────────────────────────────────────────────────────── */
 
 class Engine
 {
   public:
-    void Init(float sample_rate);
+    /** @p reverb_mem: Reverb::kMemFloats floats of delay memory (kept out
+     *  of the engine so the firmware can place it in external RAM). */
+    void Init(float sample_rate, float* reverb_mem);
 
     /** Latest parameters. Call from the audio thread, once per block. */
     void Set(const Params& p);
@@ -226,6 +280,7 @@ class Engine
 
     Kick    kick_;
     Snare   snare_;
+    Reverb  reverb_;
     DuckEnv env_k_, env_s_;
 
     /* Split: Linkwitz-Riley 4th order = two cascaded Butterworth sections. */
