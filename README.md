@@ -8,11 +8,7 @@
 lands in the hole it just made. A second trigger plays a snare, which does not duck. The ducking can
 be plain volume, low band only, or an EQ cut that follows the kick's tuning.
 
-> **Status: v0.3.2.** The firmware builds for the module, and the audio engine, the button
-> gestures, the CV depths and the web-editor descriptor pass the host tests in `tests/`. The voices
-> and the reverb were designed on paper and checked for level and pitch, not tuned by ear.
-
-Blas is laid out like Athanor: three rows, a button per row, a CV input per row.
+Blas is laid out in three rows, a button per row, a CV input per row.
 
 ```
         LEFT               BUTTON   RIGHT              CV in
@@ -202,3 +198,6 @@ If Athanor's `lib/` is already set up next door, `ln -s ../athanor/lib lib` save
 
 `lib/` is ignored by git. To track the SDK and libDaisy as submodules, as Athanor does, remove
 `lib/` from `.gitignore` and add them with `git submodule add`.
+
+
+> **This repo has been made with the help of an LLM**
