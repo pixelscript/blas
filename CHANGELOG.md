@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/pixelscript/blas/compare/v0.4.0...v0.5.0) (2026-11-18)
+
+
+### Features
+
+* tweak split behaviour ([971a7b6](https://github.com/pixelscript/blas/commit/971a7b6176aee744b3f0bc501e7e08397cd0ee94))
+
 ## [0.4.0](https://github.com/pixelscript/blas/compare/v0.3.2...v0.4.0) (2026-11-18)
 
 
