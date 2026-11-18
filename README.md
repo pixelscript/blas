@@ -6,7 +6,7 @@
 **A side-chain ducker that brings its own kick and snare, for the Hermetic Modular Alchemy Lab
 (V2).** Stereo audio goes in, a trigger ducks it, and the same trigger plays a 909-style kick that
 lands in the hole it just made. A second trigger plays a snare, which does not duck. The ducking can
-be plain volume, low band only, or an EQ cut that follows the kick's tuning.
+be plain volume, a band you place yourself, or an EQ cut that follows the kick's tuning.
 
 Blas is laid out in three rows, a button per row, a CV input per row.
 
@@ -61,8 +61,8 @@ value. A small pip shows where the knob physically is until then.
 | P2 Hold | 0 to 250 ms | Time held at the bottom before recovering. |
 | P3 Curve | | Shape of the recovery. Left: stays down, then lets go late. Noon: straight line. Right: lets go early with a long tail, like a compressor. |
 | P4 Type | Volume / Split / Carve | See [Duck types](#duck-types). |
-| P5 Focus | | Split: the crossover, 50 Hz to 1 kHz (224 Hz at noon). Carve: slides the cuts up to an octave either side of the drums' tuning (noon = on the note). |
-| P6 Width | | Carve: how wide the cut is, narrow (left) to wide (right). |
+| P5 Focus | | Split: the centre of the band, 30 Hz to 2 kHz (245 Hz at noon). Carve: slides the cut up to an octave either side of the kick's tuning (noon = on the note). |
+| P6 Width | | Split and Carve: how wide the cut is, like an EQ's Q. Narrow (left) to wide (right). |
 
 **Kick** (tap B2)
 
@@ -97,7 +97,7 @@ J3 becomes a plain side-chain trigger for a kick that lives elsewhere.
 | Type | What ducks | Use it for |
 |---|---|---|
 | **Volume** | The whole signal. | The classic pump. |
-| **Split** | Only the band below the Focus crossover. Everything above passes untouched. | Making room for the kick while hats, pads and vocals stay put. |
+| **Split** | A band you place yourself: Focus sets the centre, Width how wide, Depth how deep (100% removes the centre). Everything outside the band passes. | Clearing a fixed range, e.g. the bass's low end, whatever the kick is tuned to. |
 | **Carve** | A dynamic EQ cut just above the kick's tuning. Depth sets how deep (up to 36 dB), Width how wide. | The most transparent option. The cut follows Kick Tune and its CV. |
 
 Switching type crossfades over about 12 ms, so you can do it live or from CV.

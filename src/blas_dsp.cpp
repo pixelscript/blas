@@ -429,7 +429,7 @@ void Engine::Init(float sample_rate, float* reverb_mem)
     env_s_.Reset();
     for (int c = 0; c < 2; c++)
     {
-        for (int s = 0; s < 2; s++) { lp_[c][s].Reset(); hp_[c][s].Reset(); }
+        split_[c].Reset();
         bell_k_[c].Reset();
         bell_s_[c].Reset();
     }
@@ -456,18 +456,21 @@ void Engine::UpdateFilters()
     const float focus  = Clamp(p_.duck.focus, 0.0f, 1.0f);
     const float nyq_ok = 0.45f * sr_;
 
-    /* Split: crossover 50 Hz .. 1 kHz, 224 Hz at noon. */
-    const float split = Clamp(50.0f * std::pow(20.0f, focus), 20.0f, nyq_ok);
+    /* Width 0 = narrow (Q 3), 1 = wide (Q 0.35). Shared by Split and Carve. */
+    carve_q_ = 3.0f * std::pow(0.35f / 3.0f, Clamp(p_.duck.width, 0.0f, 1.0f));
+
+    /* Split: a band centred anywhere from 30 Hz to 2 kHz (245 Hz at noon),
+     * independent of the drums' tuning. */
+    const float split = Clamp(30.0f * std::pow(2000.0f / 30.0f, focus), 20.0f, nyq_ok);
     if (split != split_hz_)
     {
         split_hz_ = split;
         split_g_  = std::tan(kPi * split / sr_);
-        for (int c = 0; c < 2; c++)
-            for (int s = 0; s < 2; s++)
-            {
-                lp_[c][s].SetG(split_g_); lp_[c][s].SetK(1.41421356f);
-                hp_[c][s].SetG(split_g_); hp_[c][s].SetK(1.41421356f);
-            }
+    }
+    for (int c = 0; c < 2; c++)
+    {
+        split_[c].SetG(split_g_);
+        split_[c].SetK(1.0f / carve_q_);
     }
 
     /* Carve: each cut sits just above its drum's resting pitch (where the
@@ -477,9 +480,6 @@ void Engine::UpdateFilters()
     const float fs    = Clamp(p_.snare.tune_hz * 1.25f * shift, 20.0f, nyq_ok);
     if (fk != carve_k_hz_) { carve_k_hz_ = fk; carve_k_g_ = std::tan(kPi * fk / sr_); }
     if (fs != carve_s_hz_) { carve_s_hz_ = fs; carve_s_g_ = std::tan(kPi * fs / sr_); }
-
-    /* Width 0 = narrow (Q 3), 1 = wide (Q 0.35). */
-    carve_q_ = 3.0f * std::pow(0.35f / 3.0f, Clamp(p_.duck.width, 0.0f, 1.0f));
 }
 
 void Engine::TriggerKick(float vel)
@@ -578,14 +578,11 @@ void Engine::Process(const float* in_l, const float* in_r,
             {
                 float v1, v2;
 
-                /* Split */
-                lp_[c][0].Tick(x[c], v1, v2);
-                lp_[c][1].Tick(v2, v1, v2);
-                const float low = v2;
-                hp_[c][0].Tick(x[c], v1, v2);
-                float high = x[c] - hp_[c][0].k * v1 - v2;
-                hp_[c][1].Tick(high, v1, v2);
-                high = high - hp_[c][1].k * v1 - v2;
+                /* Split: take the band out by the ducking amount. k * v1 is
+                 * the band-pass at unity gain, so the centre goes to g, the
+                 * same dip Volume gives, and at rest (g = 1) it is exact. */
+                split_[c].Tick(x[c], v1, v2);
+                const float split = x[c] - (1.0f - g) * split_[c].k * v1;
 
                 /* Carve */
                 bell_k_[c].Tick(x[c], v1, v2);
@@ -593,7 +590,7 @@ void Engine::Process(const float* in_l, const float* in_r,
                 bell_s_[c].Tick(carve, v1, v2);
                 carve += bell_s_m1_ * v1;
 
-                y[c] = w0 * (x[c] * g) + w1 * (low * g + high) + w2 * carve;
+                y[c] = w0 * (x[c] * g) + w1 * split + w2 * carve;
             }
 
             out_l[done + i] = SoftClip(y[0] + drums + rev_l);

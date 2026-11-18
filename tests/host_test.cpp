@@ -311,12 +311,22 @@ int main()
     std::printf("Duck: Split\n");
     {
         Params p = Quiet();
-        p.duck.type = kDuckSplit; p.duck.depth = 0.8f; p.duck.focus = 0.5f;
-        p.duck.attack_s = 0.002f; p.duck.hold_s = 0.2f; p.duck.release_s = 0.2f;
+        p.duck.type = kDuckSplit; p.duck.depth = 0.5f; p.duck.focus = 0.5f; p.duck.width = 0.6f;
+        p.duck.attack_s = 0.002f; p.duck.hold_s = 0.3f; p.duck.release_s = 0.2f;
+        p.kick.tune_hz = 50.0f;
         const double ref = 0.5 / std::sqrt(2.0);
+        auto held = [&](const Params& q, float hz) {
+            Engine e; e.Init(kSr, NewReverbMem());
+            Run r = Render(e, q, hz, 0.5f, 1.0f, 24000, -1);
+            return Db(r.Rms(24000 + 4800, 24000 + 12000) / ref);
+        };
 
-        /* At rest the two bands must sum flat at every frequency. */
-        const float freqs[] = {40, 100, 224, 500, 2000, 8000};
+        Engine probe; probe.Init(kSr, NewReverbMem()); probe.Set(p);
+        const float fc = probe.SplitHz();
+        Check(std::fabs(fc - 244.9f) < 2.0f, "Focus at noon centres the band near 245 Hz", fc, "Hz");
+
+        /* At rest the signal is untouched at every frequency. */
+        const float freqs[] = {40, 100, 245, 500, 2000, 8000};
         double worst = 0;
         for (float f : freqs)
         {
@@ -324,18 +334,38 @@ int main()
             Run r = Render(e, p, f, 0.5f, 1.0f, -1, -1);
             worst = std::fmax(worst, std::fabs(Db(r.Rms(24000, 48000) / ref)));
         }
-        Check(worst < 0.1, "bands sum flat at rest (worst deviation)", worst, "dB");
+        Check(worst < 0.05, "flat at rest (worst deviation)", worst, "dB");
 
-        Engine lo; lo.Init(kSr, NewReverbMem());
-        Run rl = Render(lo, p, 50, 0.5f, 1.0f, 24000, -1);
-        const double low_cut = Db(rl.Rms(24000 + 2400, 24000 + 7200) / ref);
-        Check(low_cut < -20.0, "50 Hz is ducked hard", low_cut, "dB");
+        const double at_c = held(p, fc);
+        Check(std::fabs(at_c + 12.04) < 0.5, "depth 50% cuts the centre by 12 dB, like Volume", at_c, "dB");
+        const double far_hi = held(p, 5000.0f), far_lo = held(p, 30.0f);
+        Check(std::fabs(far_hi) < 0.5, "4+ octaves above the band passes", far_hi, "dB");
+        Check(far_lo > -3.0, "3 octaves below the band barely moves", far_lo, "dB");
 
-        Engine hi; hi.Init(kSr, NewReverbMem());
-        Run rh = Render(hi, p, 4000, 0.5f, 1.0f, 24000, -1);
-        const double hi_cut = Db(rh.Rms(24000 + 2400, 24000 + 7200) / ref);
-        Check(std::fabs(hi_cut) < 0.3, "4 kHz passes untouched", hi_cut, "dB");
-        Check(std::fabs(lo.SplitHz() - 223.6) < 2.0, "Focus at noon puts the crossover near 224 Hz", lo.SplitHz(), "Hz");
+        /* Full depth notches the centre right out. */
+        Params deep = p; deep.duck.depth = 1.0f;
+        const double notch = held(deep, fc);
+        Check(notch < -30.0, "depth 100% removes the centre", notch, "dB");
+
+        /* Focus places the band anywhere; it does not follow Kick Tune. */
+        Params f0 = p; f0.duck.focus = 0.0f;
+        Params f1 = p; f1.duck.focus = 1.0f;
+        Params kt = p; kt.kick.tune_hz = 110.0f;
+        Engine e0; e0.Init(kSr, NewReverbMem()); e0.Set(f0);
+        Engine e1; e1.Init(kSr, NewReverbMem()); e1.Set(f1);
+        Engine ek; ek.Init(kSr, NewReverbMem()); ek.Set(kt);
+        Check(std::fabs(e0.SplitHz() - 30.0f) < 0.5f && std::fabs(e1.SplitHz() - 2000.0f) < 5.0f,
+              "Focus spans 30 Hz to 2 kHz", e1.SplitHz(), "Hz");
+        Check(ek.SplitHz() == fc, "retuning the kick leaves the band where it is", ek.SplitHz(), "Hz");
+        Check(held(f1, 2000.0f) < -11.0 && held(f1, fc) > -2.0, "Focus right: 2 kHz ducks, 245 Hz does not",
+              held(f1, 2000.0f), "dB");
+
+        /* Width works like Q: an octave off centre, wide cuts much more. */
+        Params narrow = deep; narrow.duck.width = 0.0f;
+        Params wide   = deep; wide.duck.width   = 1.0f;
+        const double n_oct = held(narrow, fc * 2.0f), w_oct = held(wide, fc * 2.0f);
+        Check(n_oct > -2.0, "narrow: an octave above the centre is nearly untouched", n_oct, "dB");
+        Check(w_oct < -6.0, "wide: an octave above the centre is cut too", w_oct, "dB");
     }
 
     /* ── 4. Ducker: Carve ─────────────────────────────────────────────── */

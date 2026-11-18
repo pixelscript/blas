@@ -28,7 +28,7 @@ namespace blas {
 enum DuckType : int
 {
     kDuckVolume = 0,   /* the whole signal dips                               */
-    kDuckSplit  = 1,   /* only the band below the Focus crossover dips        */
+    kDuckSplit  = 1,   /* a band you place with Focus (centre) and Width (Q) dips */
     kDuckCarve  = 2,   /* a dynamic EQ cut around each drum's own tuning      */
     kDuckTypeCount
 };
@@ -63,8 +63,8 @@ struct DuckParams
     float release_s = 0.220f;  /* recovery time                               */
     float curve     = 0.60f;   /* 0..1 recovery shape: 0 late, .5 linear, 1 early */
     int   type      = kDuckVolume;
-    float focus     = 0.50f;   /* Split: crossover. Carve: shift around tuning */
-    float width     = 0.60f;   /* Carve: width of the cut (0 narrow, 1 wide)  */
+    float focus     = 0.50f;   /* Split: band centre. Carve: shift around tuning */
+    float width     = 0.60f;   /* Split and Carve: width of the cut (0 narrow, 1 wide) */
     float kick_amt  = 1.00f;   /* 0..1 how much a kick trigger ducks          */
     float snare_amt = 0.00f;   /* 0..1 how much a snare trigger ducks (fixed, no knob) */
 };
@@ -283,8 +283,8 @@ class Engine
     Reverb  reverb_;
     DuckEnv env_k_, env_s_;
 
-    /* Split: Linkwitz-Riley 4th order = two cascaded Butterworth sections. */
-    Svf lp_[2][2], hp_[2][2];
+    /* Split: one band-pass per channel, subtracted by the ducking amount. */
+    Svf split_[2];
     /* Carve: one bell per drum, per channel. */
     Svf bell_k_[2], bell_s_[2];
     float bell_k_m1_ = 0.0f, bell_s_m1_ = 0.0f;
