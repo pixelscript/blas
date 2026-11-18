@@ -198,35 +198,3 @@ If Athanor's `lib/` is already set up next door, `ln -s ../athanor/lib lib` save
 
 `lib/` is ignored by git. To track the SDK and libDaisy as submodules, as Athanor does, remove
 `lib/` from `.gitignore` and add them with `git submodule add`.
-
-## How it is put together
-
-| File | What is in it |
-|---|---|
-| `src/blas_dsp.{h,cpp}` | The audio engine: kick, snare, duck envelopes, the three duck types. No SDK dependency. |
-| `src/blas_surface.h` | The declared surface: pages, knobs, CV depth controls, Settings layout, jack labels. |
-| `src/hold_pager.h` | The SDK's Pager with one addition: it can stop listening to the pots during a button hold. |
-| `src/blas.cpp` | Hardware, audio callback, triggers, button gestures, LEDs, autosave, MIDI. |
-| `tests/host_test.cpp` | Engine checks: drum levels and pitch, ducking depth, each duck type's frequency behaviour, no clicks on type changes, safe with out-of-range values. |
-| `tests/surface_test.cpp` | Checks the hold gesture never moves a parameter, CV depths route and persist, and the web-editor descriptor builds. |
-
-Unlike Athanor, which drives the panel by hand, Blas uses the SDK's framework (Pager, Settings,
-Presets, HostLink). The CV depths are ordinary Settings controls, which is why they appear in the
-menu and the web editor without extra code.
-
-## First flash checklist
-
-Things the host tests cannot tell you, in the order worth checking:
-
-1. **Audio passes at unity** with Depth at zero, and the kick and snare play from J3 and J4.
-2. **Levels.** The drums are scaled so that full Level peaks just under the soft clipper. If they
-   are too hot or too quiet against your usual signal levels, the scaling is `level_` in
-   `Kick::Set` and `Snare::Set`.
-3. **Trigger thresholds and accent.** 1.5 V on, 0.8 V off, 4.5 V for a full-level hit
-   (`kTrigHiV`, `kTrigLoV`, `AccentVel` in `blas.cpp`).
-4. **Tap versus hold.** A press shorter than 400 ms with no knob turned is a tap (`kTapMs`); a knob
-   has to travel 2% to be taken as the one being set (`kClaimTravel`).
-5. **The voices.** Kick and snare character is all in `blas_dsp.cpp`: sweep times, the punch
-   envelope, click length, snare noise filtering. These were designed on paper and checked for
-   level and pitch, not tuned by ear.
-6. **CPU.** The web programmer's console shows `cpu.load` (worst audio block, in percent).
