@@ -97,8 +97,8 @@ int main()
         DeclareSettings(settings, presets, row_cv, refs);
         auto& h = row_cv.handle;
 
-        Check(settings.NumPages() == 5, "five settings pages (setup + four CV pages)", settings.NumPages());
-        Check(refs.cv_offset[kPageSnare][kNumPots - 1] + 4u == settings.SerializedSize(),
+        Check(settings.NumPages() == 6, "six settings pages (setup + five CV pages)", settings.NumPages());
+        Check(refs.cv_offset[kPageRumble][kRumbleKnobs - 1] + 4u == settings.SerializedSize(),
               "the last depth is the last field of the settings blob", settings.SerializedSize());
 
         const float phys[kNumPots] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
@@ -157,6 +157,7 @@ int main()
         bool     down[kNumRows] = {false, false, false};
         bool     menu = false;
         uint32_t t = 100000;
+        int      combos = 0, last_held = -1, last_tap = -1;
         auto frame = [&]() {
             for (int i = 0; i < 16; i++) g.Poll(down, menu, t + i, phys, pager);
             t += 16;
@@ -165,10 +166,10 @@ int main()
             if (menu) return;
             pager.Update(phys, t);
             const RowGestures::Actions a = g.Frame(phys, pager.Page());
+            if (a.combo_held >= 0) { combos++; last_held = a.combo_held; last_tap = a.combo_tap; }
             if (a.nav_row >= 0)
             {
-                const uint8_t target = static_cast<uint8_t>(1 + a.nav_row);
-                pager.GoToPage(pager.Page() == target ? kPageMain : target, phys);
+                pager.GoToPage(NextPageOnTap(static_cast<uint8_t>(a.nav_row), pager.Page()), phys);
             }
             if (a.depth_pot >= 0)
                 settings.SetSerializedField(refs.cv_offset[pager.Page()][a.depth_pot],
@@ -184,7 +185,8 @@ int main()
             float half = 0.5f;
             for (uint8_t pg = 0; pg < kNumAppPages; pg++)
                 for (uint8_t p = 0; p < kNumPots; p++)
-                    settings.SetSerializedField(refs.cv_offset[pg][p], reinterpret_cast<const uint8_t*>(&half), 4, phys);
+                    if (RowOf(pg, p) >= 0)
+                        settings.SetSerializedField(refs.cv_offset[pg][p], reinterpret_cast<const uint8_t*>(&half), 4, phys);
         };
 
         pager.GoToPage(kPageMain, phys);
@@ -213,7 +215,7 @@ int main()
         Check(pager.Page() == kPageKick, "tapping B2 opens the kick page", pager.Page());
 
         /* Kick page: B2 reaches all six knobs; the other buttons none. */
-        const float decay_before = pager.Stored(kPageKick, 0);
+        const float bend_before = pager.Stored(kPageKick, 0);
         down[kRowDuck] = true; frames(30);
         sweep(0, 0.60f);
         Check(g.ClaimedPot() < 0 && row_cv.Depth(kPageKick, 0) == 0.0f,
@@ -225,10 +227,10 @@ int main()
         Check(g.ClaimedPot() == 0, "kick page: holding B2 and turning P1 claims P1", g.ClaimedPot());
         down[kRowKick] = false; frames(3);
         Check(row_cv.Depth(kPageKick, 0) < -0.7f, "kick page: its CV depth is set (inverted)", row_cv.Depth(kPageKick, 0));
-        Check(pager.Stored(kPageKick, 0) == decay_before && pager.Page() == kPageKick,
-              "kick page: Decay itself did not move, still on the kick page", pager.Stored(kPageKick, 0));
+        Check(pager.Stored(kPageKick, 0) == bend_before && pager.Page() == kPageKick,
+              "kick page: Bend itself did not move, still on the kick page", pager.Stored(kPageKick, 0));
         row_cv.SetCv(kRowKick, 0.25f);
-        Check(row_cv.DeltaAtPage(kPageKick, 0) < -0.15f, "kick page: +2.5 V on J6 now pulls Decay down",
+        Check(row_cv.DeltaAtPage(kPageKick, 0) < -0.15f, "kick page: +2.5 V on J6 now pulls Bend down",
               row_cv.DeltaAtPage(kPageKick, 0));
 
         /* Every knob of every options page, with that page's own button. */
@@ -253,7 +255,49 @@ int main()
         Check(pager.Page() == kPageMain, "tapping the open page's button returns to the main page", pager.Page());
         tap(kRowDuck); tap(kRowKick);
         Check(pager.Page() == kPageKick, "tapping another row's button jumps to that row's page", pager.Page());
+
+        /* The kick has a second page: tap B2 again for Rumble. */
         tap(kRowKick);
+        Check(pager.Page() == kPageRumble, "tapping B2 on the kick page opens the rumble page", pager.Page());
+        zero_depths(); frames(1);
+        const float amount_before = pager.Stored(kPageRumble, 0);
+        down[kRowKick] = true; frames(3);
+        sweep(0, pots[0] > 0.5f ? 0.05f : 0.95f);
+        down[kRowKick] = false; frames(3);
+        Check(std::fabs(row_cv.Depth(kPageRumble, 0)) > 0.7f && pager.Stored(kPageRumble, 0) == amount_before
+              && pager.Page() == kPageRumble,
+              "rumble page: hold B2 + turn P1 sets J6's depth on Rumble, Rumble itself unmoved",
+              row_cv.Depth(kPageRumble, 0));
+        row_cv.SetCv(kRowKick, 0.25f);
+        Check(std::fabs(row_cv.DeltaAtPage(kPageRumble, 0)) > 0.15f, "rumble page: J6 then moves Rumble",
+              row_cv.DeltaAtPage(kPageRumble, 0));
+        row_cv.SetCv(kRowKick, 0.0f);
+        down[kRowKick] = true; frames(3);
+        sweep(4, pots[4] > 0.5f ? 0.05f : 0.95f);
+        Check(g.ClaimedPot() < 0, "rumble page: P5 has no knob, so nothing is claimed", g.ClaimedPot());
+        down[kRowKick] = false; frames(3);
+        Check(pager.Page() == kPageRumble, "a quick press that turned any knob is not a tap", pager.Page());
+        int rumble_set = 0;
+        for (uint8_t p = 0; p < kRumbleKnobs; p++)
+        {
+            zero_depths(); frames(1);
+            down[kRowKick] = true; frames(3);
+            sweep(p, pots[p] > 0.5f ? 0.05f : 0.95f);
+            down[kRowKick] = false; frames(3);
+            if (std::fabs(row_cv.Depth(kPageRumble, p)) > 0.7f) rumble_set++;
+        }
+        Check(rumble_set == 4, "rumble page: all four knobs take a depth from B2", rumble_set);
+        zero_depths(); frames(1);
+        down[kRowDuck] = true; frames(30);
+        sweep(1, pots[1] > 0.5f ? 0.05f : 0.95f);
+        down[kRowDuck] = false; frames(3);
+        Check(row_cv.Depth(kPageRumble, 1) == 0.0f && pager.Page() == kPageRumble,
+              "rumble page: B1 sets nothing there", row_cv.Depth(kPageRumble, 1));
+        tap(kRowKick);
+        Check(pager.Page() == kPageMain, "tapping B2 on the rumble page returns to the main page", pager.Page());
+        tap(kRowSnare); tap(kRowKick);
+        Check(pager.Page() == kPageKick, "from another row's page, B2 lands on the kick page first", pager.Page());
+        tap(kRowKick); tap(kRowKick);
 
         /* A long press with nothing turned does nothing. */
         down[kRowKick] = true; frames(40); down[kRowKick] = false; frames(3);
@@ -268,15 +312,66 @@ int main()
         menu = false; frames(4);                 /* the menu closes on this press */
         down[kRowKick] = false; frames(3);
         Check(pager.Page() == kPageMain, "the press that closes Settings does not open a page", pager.Page());
+
+        /* Combos: hold one button, tap another. */
+        combos = 0;
+        down[kRowKick] = true; frames(3);
+        tap(kRowSnare);
+        Check(combos == 1 && last_held == kRowKick && last_tap == kRowSnare,
+              "hold B2, tap B3: one combo (B2 held, B3 tapped)", combos);
+        tap(kRowSnare); tap(kRowSnare);
+        Check(combos == 3, "keep B2 held and tap B3 twice more: two more", combos);
+        down[kRowKick] = false; frames(3);
+        Check(pager.Page() == kPageMain && combos == 3, "letting go of B2 afterwards is not a tap", pager.Page());
+
+        combos = 0;
+        down[kRowSnare] = true; frames(3);
+        tap(kRowKick);
+        down[kRowSnare] = false; frames(3);
+        Check(combos == 1 && last_held == kRowSnare && last_tap == kRowKick,
+              "hold B3, tap B2: the other way round", combos);
+
+        combos = 0;
+        down[kRowDuck] = true; frames(3);
+        tap(kRowKick);
+        down[kRowDuck] = false; frames(3);
+        Check(combos == 1 && last_held == kRowDuck && last_tap == kRowKick && pager.Page() == kPageMain,
+              "hold B1, tap B2: reported, no page change", combos);
+
+        /* Not combos: a slow second press, or the Settings chord. */
+        combos = 0;
+        down[kRowKick] = true; frames(3);
+        down[kRowSnare] = true; frames(40); down[kRowSnare] = false; frames(3);
+        down[kRowKick] = false; frames(3);
+        Check(combos == 0, "B3 held for 0.6 s while B2 is down: not a combo", combos);
+        down[kRowKick] = true; frames(2); down[kRowSnare] = true; frames(130);
+        menu = true; frames(2);
+        down[kRowKick] = false; down[kRowSnare] = false; frames(3);
+        menu = false; frames(3);
+        Check(combos == 0 && pager.Page() == kPageMain, "B2+B3 held into Settings: not a combo", combos);
+
+        /* A hold that set a depth, then a combo, still keeps the depth. */
+        combos = 0;
+        tap(kRowKick);                                   /* to the kick page */
+        down[kRowKick] = true; frames(3);
+        tap(kRowSnare);
+        Check(combos == 1 && pager.Page() == kPageKick, "combos work on an options page too", combos);
+        down[kRowKick] = false; frames(3);
+        Check(pager.Page() == kPageKick, "and do not navigate", pager.Page());
+        tap(kRowKick); tap(kRowKick);
+        Check(pager.Page() == kPageMain, "(back to main)", pager.Page());
     }
 
     std::printf("Web editor descriptor\n");
     {
         presets.Manage(pager);
         presets.Manage(settings);
+        static ButtonBank bank;
+        bank.Global(b_kick_model).Global(b_snare_model).Global(b_rumble_on);
+        presets.Manage(bank);
         presets.UseNames();
 
-        const Page*   page_refs[kNumAppPages] = {&page_main, &page_duck, &page_kick, &page_snare};
+        const Page*   page_refs[kNumAppPages] = {&page_main, &page_duck, &page_kick, &page_snare, &page_rumble};
         const hostlink::PageSet pages{page_refs, kNumAppPages};
         const hostlink::DescriptorBuilder::ModuleInfo info =
             {"blas", "Blas", "0.0.0", "test", ALCHEMY_SDK_VERSION, "v2"};
@@ -294,9 +389,12 @@ int main()
         Check(len < sizeof buf / 2, "and uses under half of the SDK's descriptor buffer (bytes)", len);
         const char* want[] = {
             "\"id\":\"duck.depth\"", "\"id\":\"duck.type\"", "\"Volume\",\"Split\",\"Carve\"",
-            "\"id\":\"kick.punch\"", "\"id\":\"snare.snappy\"", "\"id\":\"snare.reverb\"", "\"id\":\"rev.source\"", "\"id\":\"cv.kick.tune\"",
+            "\"id\":\"kick.punch\"", "\"id\":\"kick.sweep\"", "\"id\":\"cv.kick.sweep\"", "\"id\":\"snare.snappy\"", "\"id\":\"snare.reverb\"", "\"id\":\"rev.source\"", "\"id\":\"cv.kick.tune\"",
             "\"id\":\"cv.snare.reverb\"", "\"id\":\"snare.bend\"", "\"id\":\"trig.accent\"", "\"id\":\"env.mode\"",
-            "\"Blas\",\"Duck\",\"Kick\",\"Snare\"", "CV: Kick (J6)", "Duck Envelope Out"};
+            "\"Blas\",\"Duck\",\"Kick\",\"Snare\",\"Rumble\"", "CV: Kick (J6)", "Duck Envelope Out",
+            "\"id\":\"rumble.amount\"", "\"id\":\"rumble.tone\"", "\"id\":\"rumble.decay\"",
+            "\"id\":\"rumble.drive\"", "\"id\":\"cv.rumble.amount\"", "\"id\":\"rumble.on\"", "CV: Rumble (J6)",
+            "\"id\":\"kick.model\"", "\"id\":\"snare.model\"", "\"909\",\"808\",\"FM\"", "\"909\",\"808\",\"Clap\""};
         int found = 0;
         for (const char* w : want)
         {
@@ -306,6 +404,22 @@ int main()
         Check(found == (int)(sizeof want / sizeof want[0]), "pages, knobs, CV depths and settings are all described", found);
         Check(presets.FitsInSlot() && presets.LiveSize() <= 512u, "the state fits a preset slot and the autosave buffer (bytes)",
               presets.LiveSize());
+        /* The model choice: SetZone (the combo) reads back, and survives a
+         * save and load of the whole preset. */
+        bank.SetZone(b_kick_model, 2);
+        bank.SetZone(b_snare_model, 1);
+        bank.Update(0);
+        Check(b_kick_model.Zone() == 2 && b_snare_model.Zone() == 1, "model combos read back (FM kick, 808 snare)",
+              b_kick_model.Zone());
+        std::vector<uint8_t> live(presets.LiveSize());
+        presets.SerializeLive(live.data(), live.size());
+        bank.SetZone(b_kick_model, 0);
+        bank.SetZone(b_snare_model, 0);
+        bank.Update(0);
+        const bool loaded = presets.DeserializeLive(live.data(), live.size());
+        bank.Update(0);
+        Check(loaded && b_kick_model.Zone() == 2 && b_snare_model.Zone() == 1, "and come back with a preset",
+              b_kick_model.Zone());
         if (!good) std::printf("%.*s\n", (int)(len < 600 ? len : 600), buf);
     }
 

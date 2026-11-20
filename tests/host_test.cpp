@@ -22,7 +22,7 @@ static const float kPi = 3.14159265358979f;
 static float* NewReverbMem()
 {
     static std::vector<std::vector<float>> pool;
-    pool.emplace_back(Reverb::kMemFloats, 123.0f);
+    pool.emplace_back(Engine::kMemFloats, 123.0f);
     return pool.back().data();
 }
 
@@ -120,6 +120,60 @@ int main()
         Check(std::fabs(tail - 50.0) < 3.0, "tail settles on the tuned pitch", tail, "Hz");
         const double early = ZeroCrossHz(r, 480, 480 + 1440);
         Check(early > 80.0, "pitch starts well above the tuning", early, "Hz");
+        /* Sweep: same Bend, left snaps down, right glides. Pitch 20-40 ms,
+         * 80-120 ms and (for the fast end) 20-100 ms after the hit. */
+        {
+            Params q = p; q.kick.bend = 0.6f; q.kick.punch = 0.0f;
+            q.kick.sweep = 0.0f;
+            Engine ef; ef.Init(kSr, NewReverbMem());
+            Run rf = Render(ef, q, 0, 0, 1.0f, 480, -1);
+            q.kick.sweep = 1.0f;
+            Engine es; es.Init(kSr, NewReverbMem());
+            Run rs = Render(es, q, 0, 0, 1.0f, 480, -1);
+            const double f_early = ZeroCrossHz(rf, 480 + 960, 480 + 1920);
+            const double s_early = ZeroCrossHz(rs, 480 + 960, 480 + 1920);
+            const double f_late  = ZeroCrossHz(rf, 480 + 3840, 480 + 5760);
+            const double s_late  = ZeroCrossHz(rs, 480 + 3840, 480 + 5760);
+            std::printf("       sweep 0 / 1: pitch at 20-40 ms %.0f / %.0f Hz, at 80-120 ms %.0f / %.0f Hz\n",
+                        f_early, s_early, f_late, s_late);
+            const double f_settled = ZeroCrossHz(rf, 480 + 960, 480 + 4800);
+            Check(std::fabs(f_settled - 50.0) < 4.0, "sweep left: on the tuned pitch from 20 ms", f_settled, "Hz");
+            Check(s_early > 1.8 * f_settled, "sweep right: still well above it at 20-40 ms", s_early, "Hz");
+            Check(s_late > 55.0 && s_late < s_early, "sweep right: still gliding down at 100 ms", s_late, "Hz");
+            const double s_end = ZeroCrossHz(rs, 480 + 14400, 480 + 24000);
+            Check(std::fabs(s_end - 50.0) < 4.0, "sweep right: settled by 300 ms", s_end, "Hz");
+            q.kick.bend = 0.0f;
+            Engine e0; e0.Init(kSr, NewReverbMem());
+            Run r0 = Render(e0, q, 0, 0, 1.0f, 480, -1);
+            Check(std::fabs(ZeroCrossHz(r0, 480 + 960, 480 + 4800) - 50.0) < 3.0,
+                  "bend zero: sweep has nothing to do", ZeroCrossHz(r0, 480 + 960, 480 + 4800), "Hz");
+        }
+        /* Punch: the front stands out from the tail. Click: bright, brief. */
+        {
+            auto hit = [&](float punch, float click) {
+                Params q = p; q.kick.punch = punch; q.kick.click = click;
+                Engine e; e.Init(kSr, NewReverbMem());
+                return Render(e, q, 0, 0, 0.5f, 480, -1);
+            };
+            auto hf = [](const Run& r, size_t a, size_t b) {     /* 2nd difference: rises ~12 dB/oct */
+                double s = 0;
+                for (size_t i = a + 2; i < b; i++) { const double d = r.l[i] - 2.0 * r.l[i - 1] + r.l[i - 2]; s += d * d; }
+                return Db(std::sqrt(s / (double)(b - a - 2)));
+            };
+            const Run p0 = hit(0.0f, 0.0f), p1 = hit(1.0f, 0.0f);
+            const double c0 = Db(p0.Rms(480, 480 + 1440)) - Db(p0.Rms(480 + 7200, 480 + 12000));
+            const double c1 = Db(p1.Rms(480, 480 + 1440)) - Db(p1.Rms(480 + 7200, 480 + 12000));
+            Check(c1 - c0 > 6.0, "full Punch: front stands 6+ dB further out from the tail", c1 - c0, "dB");
+            Check(Db(p1.Rms(480, 480 + 1440)) > Db(p0.Rms(480, 480 + 1440)) - 2.0,
+                  "Punch keeps the front at (nearly) full level", Db(p1.Rms(480, 480 + 1440)) - Db(p0.Rms(480, 480 + 1440)), "dB");
+            const Run k0 = hit(0.5f, 0.0f), k1 = hit(0.5f, 1.0f);
+            const double lift = hf(k1, 480, 960) - hf(k0, 480, 960);
+            Check(lift > 30.0, "full Click: 30+ dB more top end in the first 10 ms", lift, "dB");
+            Check(hf(k1, 480, 960) > Db(k1.Peak(480, 1920)) - 20.0, "and it sits within 20 dB of the hit",
+                  hf(k1, 480, 960) - Db(k1.Peak(480, 1920)), "dB");
+            Check(hf(k1, 480 + 1440, 480 + 2400) < Db(k1.Peak(480, 1920)) - 60.0,
+                  "and is gone by 30 ms (60+ dB below the hit)", hf(k1, 480 + 1440, 480 + 2400) - Db(k1.Peak(480, 1920)), "dB");
+        }
         Check(Db(r.Rms(480 + 24000, 480 + 26400)) < -55.0, "decayed after its decay time",
               Db(r.Rms(480 + 24000, 480 + 26400)), "dB");
         Check(r.Peak(72000, 96000) == 0.0, "returns to exact silence", r.Peak(72000, 96000));
@@ -266,6 +320,231 @@ int main()
         }
         Check(side0 == 0.0, "snare-only: a kick stays dry and mono", side0);
         Check(side1 > 1e-3, "kick + snare: the kick gets a tail too", side1);
+    }
+
+    std::printf("Drum models\n");
+    {
+        auto peak_of = [](const Run& r) { return r.Peak(0, r.l.size()); };
+        auto top = [](const Run& r, size_t a, size_t b) {   /* 2nd difference: ~12 dB/oct tilt */
+            double s = 0;
+            for (size_t i = a + 2; i < b; i++) { const double d = r.l[i] - 2.0 * r.l[i - 1] + r.l[i - 2]; s += d * d; }
+            return Db(std::sqrt(s / (double)(b - a - 2)));
+        };
+        const char* kn[] = {"909", "808", "FM"};
+        Run k[kKickModelCount];
+        for (int m = 0; m < kKickModelCount; m++)
+        {
+            Params p; p.duck.depth = 0; p.snare.level = 0; p.kick.level = 1.0f; p.kick.tune_hz = 50.0f;
+            p.kick.model = m;
+            Engine e; e.Init(kSr, NewReverbMem());
+            k[m] = Render(e, p, 0, 0, 2.0f, 480, -1);
+            char what[96];
+            std::snprintf(what, sizeof what, "kick %s: finite, within +-1, audible", kn[m]);
+            Check(k[m].Finite() && peak_of(k[m]) <= 1.0 && peak_of(k[m]) > 0.4, what, peak_of(k[m]));
+            std::snprintf(what, sizeof what, "kick %s: settles on the tuned pitch", kn[m]);
+            const double f = ZeroCrossHz(k[m], 480 + 9600, 480 + 16800);
+            Check(std::fabs(f - 50.0) < 3.0, what, f, "Hz");
+            std::snprintf(what, sizeof what, "kick %s: silent again after 2 s", kn[m]);
+            Check(k[m].Peak(72000, 96000) == 0.0, what, k[m].Peak(72000, 96000));
+        }
+        Check(top(k[1], 480, 960) < top(k[0], 480, 960) - 30.0, "808 kick: no bright click (top end vs 909)",
+              top(k[1], 480, 960) - top(k[0], 480, 960), "dB");
+        Check(Db(k[1].Rms(480 + 14400, 480 + 19200)) > Db(k[0].Rms(480 + 14400, 480 + 19200)) + 6.0,
+              "808 kick: longer boom than 909 at the same Decay", Db(k[1].Rms(480 + 14400, 480 + 19200)) - Db(k[0].Rms(480 + 14400, 480 + 19200)), "dB");
+        Check(top(k[2], 480, 960) > top(k[1], 480, 960) + 20.0, "FM kick: a brighter attack than 808",
+              top(k[2], 480, 960) - top(k[1], 480, 960), "dB");
+        {
+            /* FM brightness follows Click. */
+            Params p; p.duck.depth = 0; p.snare.level = 0; p.kick.level = 1.0f; p.kick.model = kKickFm;
+            p.kick.click = 0.0f;
+            Engine a; a.Init(kSr, NewReverbMem()); Run r0 = Render(a, p, 0, 0, 0.2f, 480, -1);
+            p.kick.click = 1.0f;
+            Engine b; b.Init(kSr, NewReverbMem()); Run r1 = Render(b, p, 0, 0, 0.2f, 480, -1);
+            Check(top(r1, 480, 960) > top(r0, 480, 960) + 10.0, "FM kick: Click brightens the attack",
+                  top(r1, 480, 960) - top(r0, 480, 960), "dB");
+        }
+
+        const char* sn[] = {"909", "808", "Clap"};
+        Run s[kSnareModelCount];
+        for (int m = 0; m < kSnareModelCount; m++)
+        {
+            Params p; p.duck.depth = 0; p.kick.level = 0; p.snare.level = 1.0f; p.snare.model = m;
+            Engine e; e.Init(kSr, NewReverbMem());
+            s[m] = Render(e, p, 0, 0, 1.5f, -1, 480);
+            char what[96];
+            std::snprintf(what, sizeof what, "snare %s: finite, within +-1, audible", sn[m]);
+            Check(s[m].Finite() && peak_of(s[m]) <= 1.0 && peak_of(s[m]) > 0.5, what, peak_of(s[m]));
+            std::snprintf(what, sizeof what, "snare %s: silent again after 1 s", sn[m]);
+            Check(s[m].Peak(48000 + 480, 72000) == 0.0, what, s[m].Peak(48000 + 480, 72000));
+        }
+        {
+            /* Clap: the 2 ms slices at each burst stand well above the gaps
+             * between them. Bend 0.3 puts bursts 9 ms apart. */
+            const Run& c = s[2];
+            auto slice = [&](double ms) { const size_t a = 480 + (size_t)(ms * 48.0); return Db(c.Rms(a, a + 96)); };
+            const double on  = (slice(0) + slice(9) + slice(18)) / 3.0;
+            const double off = (slice(6) + slice(15)) / 2.0;
+            Check(on - off > 8.0, "clap: three distinct bursts (burst over gap)", on - off, "dB");
+            Check(Db(c.Rms(480 + 1440, 480 + 4800)) > -30.0, "clap: a tail follows the bursts", Db(c.Rms(480 + 1440, 480 + 4800)), "dB");
+        }
+
+        /* A model change waits for the next hit: the tail keeps its voice. */
+        {
+            Params p; p.duck.depth = 0; p.snare.level = 0; p.kick.level = 1.0f;
+            Engine a; a.Init(kSr, NewReverbMem());
+            Run ra = Render(a, p, 0, 0, 0.5f, 480, -1);
+            Engine b; b.Init(kSr, NewReverbMem());
+            Run rb  = Render(b, p, 0, 0, 0.1f, 480, -1);
+            p.kick.model = kKickFm;
+            Run rb2 = Render(b, p, 0, 0, 0.4f, -1, -1);
+            double diff = 0;
+            for (size_t i = 0; i < rb2.l.size(); i++) diff = std::fmax(diff, std::fabs(rb2.l[i] - ra.l[4800 + i]));
+            Check(diff < 1e-6, "switching model mid-tail leaves the ringing hit alone", diff);
+            Run rb3 = Render(b, p, 0, 0, 0.1f, 10, -1);
+            Engine c; c.Init(kSr, NewReverbMem());
+            Run fresh = Render(c, p, 0, 0, 0.1f, 10, -1);
+            Check(std::fabs(top(rb3, 10, 490) - top(fresh, 10, 490)) < 1.0 && rb3.Finite(),
+                  "the next hit uses the new model (top end vs a fresh FM hit)", top(rb3, 10, 490) - top(fresh, 10, 490), "dB");
+        }
+
+        /* Everything at maximum, every model, stays bounded. */
+        {
+            double worst = 0; bool fin = true;
+            for (int km = 0; km < kKickModelCount; km++)
+                for (int sm = 0; sm < kSnareModelCount; sm++)
+                {
+                    Params p; p.duck.depth = 0;
+                    p.kick  = {km, 120.0f, 1.0f, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+                    p.snare = {sm, 330.0f, 1.0f, 0.6f, 1.0f, 1.0f, 1.0f, 1.0f};
+                    Engine e; e.Init(kSr, NewReverbMem());
+                    Run r = Render(e, p, 0, 0, 0.3f, 100, 100);
+                    fin = fin && r.Finite();
+                    worst = std::fmax(worst, r.Peak(0, r.l.size()));
+                }
+            Check(fin && worst <= 1.0, "every model pair, everything at maximum: within +-1", worst);
+        }
+    }
+
+    std::printf("Rumble\n");
+    {
+        /* Four-on-the-floor at 125 BPM; the rumble is the difference from
+         * the same kicks without it. */
+        const size_t beat = 23040;
+        auto render = [&](RumbleParams rp, int hits, size_t n_beats, float kick_level = 1.0f,
+                          int off_after_beat = -1) {
+            Params p; p.duck.depth = 0; p.snare.level = 0; p.kick.level = kick_level; p.kick.tune_hz = 50.0f;
+            p.rumble = rp;
+            Engine e; e.Init(kSr, NewReverbMem());
+            Run out; out.l.resize(beat * n_beats); out.r.resize(beat * n_beats);
+            std::vector<float> z(24, 0.0f);
+            for (size_t pos = 0; pos < out.l.size(); pos += 24)
+            {
+                if (off_after_beat >= 0 && pos == beat * (size_t)off_after_beat + 4800) p.rumble.on = false;
+                e.Set(p);
+                if (pos % beat == 0 && pos / beat < (size_t)hits) e.TriggerKick(1.0f);
+                e.Process(z.data(), z.data(), &out.l[pos], &out.r[pos], 24);
+            }
+            return out;
+        };
+        auto minus = [](const Run& a, const Run& b) {
+            Run d; d.l.resize(a.l.size()); d.r.resize(a.l.size());
+            for (size_t i = 0; i < a.l.size(); i++) { d.l[i] = a.l[i] - b.l[i]; d.r[i] = a.r[i] - b.r[i]; }
+            return d;
+        };
+        auto band = [&](const Run& v, size_t a, size_t b, double f_lo, double f_hi) {
+            double e = 0;
+            for (double f = f_lo; f < f_hi; f *= 1.12)
+            {
+                double re = 0, im = 0;
+                for (size_t i = a; i < b; i++) { const double ph = 2.0 * kPi * f * (double)i / kSr; re += v.l[i] * std::cos(ph); im += v.l[i] * std::sin(ph); }
+                e += re * re + im * im;
+            }
+            return 10.0 * std::log10(e + 1e-30);
+        };
+        RumbleParams none; none.amount = 0.0f;
+        const Run kicks = render(none, 8, 9);
+        const size_t b6 = beat * 6;
+
+        RumbleParams rp; rp.amount = 1.0f;
+        const Run full = render(rp, 8, 9);
+        const Run r = minus(full, kicks);
+        Check(full.Finite() && full.Peak(0, full.l.size()) <= 1.0, "full rumble: finite, mix within +-1",
+              full.Peak(0, full.l.size()));
+        const double under = Db(r.Rms(b6, b6 + 960)), swell = Db(r.Rms(b6 + 12000, b6 + 16800));
+        Check(swell - under > 25.0, "pumps: 25+ dB louder between kicks than under them", swell - under, "dB");
+        Check(swell > -20.0 && r.Peak(b6, b6 + beat) < kicks.Peak(b6, b6 + beat),
+              "audible, but peaks below the kick", r.Peak(b6, b6 + beat));
+        double side = 0;
+        for (size_t i = b6; i < b6 + beat; i++) side = std::fmax(side, std::fabs(r.l[i] - r.r[i]));
+        Check(side == 0.0, "mono", side);
+
+        RumbleParams half = rp; half.amount = 0.5f;
+        const Run rh = minus(render(half, 8, 9), kicks);
+        Check(Db(rh.Rms(b6 + 12000, b6 + 16800)) < swell - 6.0, "half Amount is well quieter",
+              Db(rh.Rms(b6 + 12000, b6 + 16800)) - swell, "dB");
+
+        RumbleParams dark = rp; dark.tone_hz = 60.0f;
+        RumbleParams bright = rp; bright.tone_hz = 400.0f;
+        const Run rd = minus(render(dark, 8, 9), kicks), rb = minus(render(bright, 8, 9), kicks);
+        const double d_hi = band(rd, b6, b6 + beat, 300, 1200) - band(rd, b6, b6 + beat, 30, 120);
+        const double b_hi = band(rb, b6, b6 + beat, 300, 1200) - band(rb, b6, b6 + beat, 30, 120);
+        Check(b_hi - d_hi > 20.0, "Tone: 400 Hz lets far more 300 Hz-1.2 kHz through than 60 Hz", b_hi - d_hi, "dB");
+
+        RumbleParams clean = rp; clean.drive = 0.0f;
+        RumbleParams dirty = rp; dirty.drive = 1.0f;
+        const Run rc = minus(render(clean, 8, 9), kicks), rx = minus(render(dirty, 8, 9), kicks);
+        const double c_h = band(rc, b6, b6 + beat, 280, 1000) - band(rc, b6, b6 + beat, 30, 140);
+        const double x_h = band(rx, b6, b6 + beat, 280, 1000) - band(rx, b6, b6 + beat, 30, 140);
+        Check(x_h - c_h > 10.0, "Drive adds harmonics (upper band vs lows)", x_h - c_h, "dB");
+        Check(std::fabs(Db(rx.Rms(b6, b6 + beat)) - Db(rc.Rms(b6, b6 + beat))) < 4.0,
+              "without changing the level much", Db(rx.Rms(b6, b6 + beat)) - Db(rc.Rms(b6, b6 + beat)), "dB");
+
+        RumbleParams shorter = rp; shorter.decay_s = 0.4f;
+        RumbleParams longer  = rp; longer.decay_s  = 4.0f;
+        const Run k1 = render(none, 1, 3);
+        const Run rs = minus(render(shorter, 1, 3), k1), rl = minus(render(longer, 1, 3), k1);
+        Check(Db(rl.Rms(48000, 57600)) - Db(rs.Rms(48000, 57600)) > 40.0, "Decay: 4 s still rings at 1 s, 0.4 s does not",
+              Db(rl.Rms(48000, 57600)) - Db(rs.Rms(48000, 57600)), "dB");
+
+        /* Off: no new rumble, but the tail rings out rather than cutting. */
+        const Run roff = minus(render(rp, 8, 9, 1.0f, 5), kicks);
+        const size_t off_at = beat * 5 + 4800;
+        Check(Db(roff.Rms(off_at + 4800, off_at + 9600)) > Db(r.Rms(off_at + 4800, off_at + 9600)) - 12.0,
+              "switched off: the tail carries on ringing", Db(roff.Rms(off_at + 4800, off_at + 9600)) - Db(r.Rms(off_at + 4800, off_at + 9600)), "dB");
+        /* Same switch-off with the kicks stopping there. Later kicks can only
+         * pump the old tail down, never add to it. */
+        const Run roff_quiet = minus(render(rp, 6, 9, 1.0f, 5), render(none, 6, 9));
+        bool louder = false;
+        for (size_t b = 6; b < 9; b++)
+            if (Db(roff.Rms(beat * b, beat * (b + 1))) > Db(roff_quiet.Rms(beat * b, beat * (b + 1))) + 0.1) louder = true;
+        Check(!louder, "and the kicks after it add no new rumble (never louder than with no kicks)",
+              Db(roff.Rms(beat * 7, beat * 8)) - Db(roff_quiet.Rms(beat * 7, beat * 8)), "dB");
+
+        /* Ghost kick: no kick audio, no rumble. */
+        const Run ghost = render(rp, 8, 9, 0.0f);
+        Check(ghost.Peak(0, ghost.l.size()) == 0.0, "Kick Level at zero: no rumble either", ghost.Peak(0, ghost.l.size()));
+
+        /* Everything at maximum with every kick model: bounded. */
+        double worst = 0; bool fin = true;
+        for (int km = 0; km < kKickModelCount; km++)
+        {
+            Params p; p.duck.depth = 0; p.snare.level = 1.0f;
+            p.kick = {km, 120.0f, 1.0f, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+            p.rumble = {true, 1.0f, 400.0f, 4.0f, 1.0f};
+            p.reverb.amount = 1.0f; p.reverb.kick = true;
+            Engine e; e.Init(kSr, NewReverbMem());
+            Run out; out.l.resize(beat * 4); out.r.resize(beat * 4);
+            std::vector<float> z(24, 0.0f);
+            for (size_t pos = 0; pos < out.l.size(); pos += 24)
+            {
+                if (pos % 6000 == 0) { e.TriggerKick(1.0f); e.TriggerSnare(1.0f); }
+                e.Set(p);
+                e.Process(z.data(), z.data(), &out.l[pos], &out.r[pos], 24);
+            }
+            fin = fin && out.Finite();
+            worst = std::fmax(worst, out.Peak(0, out.l.size()));
+        }
+        Check(fin && worst <= 1.0, "rumble, reverb and both drums at maximum, fast hits: within +-1", worst);
     }
 
     /* ── 2. Ducker: Volume ────────────────────────────────────────────── */

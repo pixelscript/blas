@@ -8,6 +8,11 @@
  * duck knob, B2 how much J6 moves a kick knob, B3 how much J7 moves a
  * snare knob. On another row's options page a button has no knobs to set.
  *
+ * Hold one button and tap another: a combo, reported as (held, tapped).
+ * Holding on and tapping again repeats it. The held button's release then
+ * does nothing. A combo needs a quick tap, so holding B2 + B3 for two
+ * seconds still opens the Settings menu.
+ *
  * Pure logic over a HoldPager, so the host tests can play button and knob
  * sequences through it. blas.cpp feeds it the buttons every millisecond
  * (Poll) and the pots every frame (Frame), and carries out what it asks.
@@ -31,6 +36,8 @@ class RowGestures
     struct Actions
     {
         int8_t nav_row   = -1;     /* >= 0: toggle this row's options page    */
+        int8_t combo_held = -1;    /* >= 0: this button was held ...          */
+        int8_t combo_tap  = -1;    /*       ... while this one was tapped     */
         int8_t depth_pot = -1;     /* >= 0: write depth_pos to this pot's depth */
         float  depth_pos = 0.5f;   /* pot position, 0..1 (noon = no CV)       */
     };
@@ -66,15 +73,25 @@ class RowGestures
                 b.poisoned = menu;
                 if (num_down > 1)
                 {
-                    /* Two buttons is the Settings chord (B2+B3), never ours. */
+                    /* A second button: the start of a combo (or of the
+                     * Settings chord). Nothing else may come of either
+                     * press. With all three down, nothing at all. */
                     for (uint8_t j = 0; j < kNumRows; j++)
                         if (down[j]) btn_[j].poisoned = true;
                     if (held_row_ >= 0) End(pager);
+                    combo_tap_ = -1;
+                    if (num_down == 2 && !menu)
+                    {
+                        for (uint8_t j = 0; j < kNumRows; j++)
+                            if (j != i && down[j]) combo_held_ = static_cast<int8_t>(j);
+                        combo_tap_ = static_cast<int8_t>(i);
+                    }
                 }
                 else if (!menu)
                 {
                     held_row_    = static_cast<int8_t>(i);
                     claimed_pot_ = -1;
+                    moved_       = false;
                     held_since_  = t_ms;
                     last_pos_    = -1.0f;
                     std::memcpy(press_phys_, phys, sizeof(press_phys_));
@@ -82,11 +99,23 @@ class RowGestures
                 }
             }
 
+            if (falling && combo_tap_ == static_cast<int8_t>(i))
+            {
+                const bool quick = (t_ms - b.down_ms) < kTapMs;
+                if (quick && !menu && combo_held_ >= 0 && down[combo_held_])
+                {
+                    combo_req_held_ = combo_held_;
+                    combo_req_tap_  = combo_tap_;
+                }
+                combo_tap_ = -1;
+            }
+
             if (falling)
             {
                 if (held_row_ == static_cast<int8_t>(i) && !b.poisoned)
                 {
-                    const bool tap = claimed_pot_ < 0 && (t_ms - b.down_ms) < kTapMs;
+                    /* A tap: quick, and no knob moved while it was down. */
+                    const bool tap = !moved_ && (t_ms - b.down_ms) < kTapMs;
                     End(pager);
                     if (tap) nav_request_ = static_cast<int8_t>(i);
                 }
@@ -95,6 +124,7 @@ class RowGestures
         }
 
         if (gated && held_row_ >= 0) End(pager);
+        if (gated) combo_tap_ = -1;
     }
 
     /** Once per frame, after the pager has updated. */
@@ -103,9 +133,16 @@ class RowGestures
         Actions a;
         a.nav_row    = nav_request_;
         nav_request_ = -1;
+        a.combo_held    = combo_req_held_;
+        a.combo_tap     = combo_req_tap_;
+        combo_req_held_ = combo_req_tap_ = -1;
 
         if (held_row_ >= 0)
         {
+            /* Any knob moving means this press is not a tap. */
+            for (uint8_t p = 0; p < kNumPots && !moved_; p++)
+                if (std::fabs(phys[p] - press_phys_[p]) > kClaimTravel) moved_ = true;
+
             /* The first of the held row's knobs to move is the one being
              * set. */
             if (claimed_pot_ < 0)
@@ -158,7 +195,11 @@ class RowGestures
     bool     was_gated_   = false;
     int8_t   held_row_    = -1;    /* row button owning the current hold */
     int8_t   claimed_pot_ = -1;    /* the knob whose depth is being set  */
+    bool     moved_       = false; /* a knob moved during this hold      */
     int8_t   nav_request_ = -1;    /* tapped row, handed to the next frame */
+    int8_t   combo_held_  = -1;    /* combo in progress: held button ...   */
+    int8_t   combo_tap_   = -1;    /* ... and the one pressed while held   */
+    int8_t   combo_req_held_ = -1, combo_req_tap_ = -1;   /* for the next frame */
     uint32_t held_since_  = 0;
     float    press_phys_[kNumPots] = {};
     float    last_pos_    = -1.0f;

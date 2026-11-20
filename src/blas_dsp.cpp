@@ -58,35 +58,93 @@ constexpr float kSilence = 1.0e-5f;
 void Kick::Init(float sr)
 {
     sr_           = sr;
-    punch_coef_   = CoefTau(0.004f, sr);     /* the knock lasts a few ms */
-    click_coef_   = CoefTau(0.0015f, sr);
+    punch_coef_   = CoefTau(0.030f, sr);     /* the loud front: ~30 ms     */
+    knock_coef_   = CoefTau(0.007f, sr);     /* the pitch knock: ~7 ms     */
+    click_coef_   = CoefTau(0.0035f, sr);    /* the click: ~3.5 ms         */
+    thump_coef_   = CoefTau(0.0025f, sr);    /* 808 thump: ~2.5 ms         */
+    idx_coef_     = CoefTau(0.015f, sr);     /* FM brightness: ~15 ms      */
+    click_hp_a_   = std::exp(-2.0f * kPi * 1200.0f / sr);   /* noise above 1.2 kHz */
+    click_inc_    = 2100.0f / sr;            /* the beater's ping          */
     declick_coef_ = CoefTau(0.0015f, sr);
+    model_        = kKick909;
     Set(KickParams{});
 }
 
 void Kick::Set(const KickParams& p)
 {
+    p_ = p;
+    Recompute();
+}
+
+void Kick::Recompute()
+{
+    const KickParams& p = p_;
     const float tune  = Clamp(p.tune_hz, 20.0f, 400.0f);
-    const float decay = Clamp(p.decay_s, 0.03f, 5.0f);
+    float       decay = Clamp(p.decay_s, 0.03f, 5.0f);
     const float bend  = Clamp(p.bend, 0.0f, 1.0f);
     const float punch = Clamp(p.punch, 0.0f, 1.0f);
     const float drive = Clamp(p.drive, 0.0f, 1.0f);
     const float level = Clamp(p.level, 0.0f, 1.0f);
+    const float click = Clamp(p.click, 0.0f, 1.0f);
+    const float sweep = Clamp(p.sweep, 0.0f, 1.0f);
 
-    inc_      = tune / sr_;
-    amp_coef_ = Coef60(decay, sr_);
+    /* Bend sets how far the pitch drops; Sweep how it gets back down.
+     * Sweep turns two things together: the time constant (5 ms snap to
+     * 90 ms glide, 21 ms at noon) and the curve. Left the drop is squared,
+     * reaching the tuned pitch early like an 808; right it is e*(2-e),
+     * hanging high before it falls, like a 909. At noon the two average to
+     * a plain exponential. */
+    float bend_depth = 6.0f;
+    bend_coef_ = CoefTau(0.005f * std::pow(18.0f, sweep), sr_);
+    bend_sq_   = 1.0f - sweep;
+    bend_rt_   = sweep;
 
-    /* Bend: the classic slow sweep. More bend is deeper and a little longer. */
-    bend_amt_  = bend * bend * 6.0f;
-    bend_coef_ = CoefTau(0.020f + 0.050f * bend, sr_);
-
-    /* Punch: a very fast pitch spike plus a level bump into the saturator. */
+    /* Punch is a transient shaper on the body: the first ~30 ms stay at
+     * full level while everything after drops, by up to 9 dB, so the
+     * front stands out against the tail. A short pitch knock (up to two
+     * octaves, ~7 ms) gives it the hit. */
     punch_pitch_ = punch * 3.0f;
-    punch_amp_   = punch;
+    punch_depth_ = punch * 0.65f;
 
-    click_gain_ = Clamp(p.click, 0.0f, 1.0f) * 0.7f;
+    click_gain_ = click * 0.9f;
+    float drive_amt = drive * drive * 14.0f;
+    fm_ratio_ = 1.0f;
+    fm_index_ = 0.0f;
 
-    drive_g_    = 1.0f + drive * drive * 14.0f;
+    switch (model_)
+    {
+        case kKick808:
+            /* A resonant boom: the pitch only drops a little, the tail is
+             * half as long again, the click is a soft low thump and the
+             * drive is gentler. */
+            bend_depth   = 2.0f;
+            decay       *= 1.5f;
+            punch_pitch_ = punch * 1.0f;
+            click_gain_  = click * 0.8f;
+            drive_amt    = drive * drive * 8.0f;
+            break;
+
+        case kKickFm:
+            /* Two operators. Click sets how bright the attack is (the
+             * modulation index, 1.5 to 9.5 radians, fading over ~15 ms), Punch
+             * the modulator's ratio: 1 is warm, 2 hollow, in between clangs.
+             * Even at zero Click there is a little FM edge (1.5 radians).
+             * The body underneath is the same swept sine. */
+            fm_index_    = 1.5f + click * 8.0f;
+            fm_ratio_    = 1.0f + punch * 3.0f;
+            punch_pitch_ = 0.0f;
+            punch_depth_ = 0.0f;
+            click_gain_  = 0.0f;
+            break;
+
+        default:
+            break;
+    }
+
+    inc_       = tune / sr_;
+    amp_coef_  = Coef60(Clamp(decay, 0.03f, 7.5f), sr_);
+    bend_amt_  = bend * bend * bend_depth;
+    drive_g_    = 1.0f + drive_amt;
     drive_norm_ = 1.0f / FastTanh(drive_g_);
 
     level_       = level * level;
@@ -95,6 +153,10 @@ void Kick::Set(const KickParams& p)
 
 void Kick::Trigger(float vel)
 {
+    /* A model change waits for a hit, so a tail never changes voice. */
+    const int want = (p_.model >= 0 && p_.model < kKickModelCount) ? p_.model : kKick909;
+    if (want != model_) { model_ = want; Recompute(); }
+
     vel_         = Clamp(vel, 0.0f, 1.0f);
     gain_target_ = level_ * vel_;
     gain_        = gain_target_;
@@ -103,11 +165,16 @@ void Kick::Trigger(float vel)
      * the restart cannot click. */
     declick_   = last_;
     phase_     = 0.0f;
+    mph_       = 0.0f;
     amp_       = 1.0f;
     env_bend_  = 1.0f;
     env_punch_ = 1.0f;
+    env_knock_ = 1.0f;
     env_click_ = 1.0f;
-    click_lp_  = 0.0f;
+    env_idx_   = 1.0f;
+    click_hp_  = 0.0f;
+    click_prev_ = 0.0f;
+    click_ph_  = 0.0f;
 }
 
 float Kick::Tick()
@@ -115,7 +182,7 @@ float Kick::Tick()
     if (amp_ < kSilence && env_click_ < kSilence
         && declick_ < kSilence && declick_ > -kSilence)
     {
-        amp_ = env_click_ = env_bend_ = env_punch_ = 0.0f;
+        amp_ = env_click_ = env_bend_ = env_punch_ = env_knock_ = env_idx_ = 0.0f;
         declick_ = 0.0f;
         last_    = 0.0f;
         return 0.0f;
@@ -123,23 +190,61 @@ float Kick::Tick()
 
     gain_ += 0.002f * (gain_target_ - gain_);
 
-    const float pitch = 1.0f + bend_amt_ * env_bend_ + punch_pitch_ * env_punch_;
+    const float bend_env = bend_sq_ * env_bend_ * env_bend_
+                         + bend_rt_ * env_bend_ * (2.0f - env_bend_);
+    const float pitch    = 1.0f + bend_amt_ * bend_env + punch_pitch_ * env_knock_;
     phase_ += inc_ * pitch;
     if (phase_ >= 1.0f) phase_ -= 1.0f;
     if (phase_ >= 1.0f) phase_ = 0.0f;
 
-    float body = Sin01(phase_) * amp_ * (1.0f + punch_amp_ * env_punch_);
+    float osc;
+    if (model_ == kKickFm)
+    {
+        mph_ += inc_ * pitch * fm_ratio_;
+        while (mph_ >= 1.0f) mph_ -= 1.0f;
+        /* Phase modulation, index in radians -> cycles. */
+        float ph = phase_ + fm_index_ * env_idx_ * (1.0f / (2.0f * kPi)) * Sin01(mph_);
+        ph -= std::floor(ph);
+        osc = Sin01(ph);
+    }
+    else
+    {
+        osc = Sin01(phase_);
+    }
+
+    const float shaper = 1.0f - punch_depth_ * (1.0f - env_punch_);
+    float body = osc * amp_ * shaper;
     body = FastTanh(body * drive_g_) * drive_norm_;
 
-    const float click = (noise_.Next() * 0.6f + 0.8f) * env_click_;
-    click_lp_ += 0.5f * (click - click_lp_);
+    float click = 0.0f;
+    if (env_click_ > kSilence && click_gain_ > 0.0f)
+    {
+        if (model_ == kKick808)
+        {
+            /* A soft, low thump: a one-sided pulse, no top end. */
+            click = env_click_;
+        }
+        else
+        {
+            /* Click: a beater hitting the skin. High-passed noise plus a
+             * short 2.1 kHz ping, both gone in a few milliseconds. */
+            const float n = noise_.Next();
+            click_hp_  = click_hp_a_ * (click_hp_ + n - click_prev_);
+            click_prev_ = n;
+            click_ph_ += click_inc_;
+            if (click_ph_ >= 1.0f) click_ph_ -= 1.0f;
+            click = (0.6f * click_hp_ + 0.7f * Sin01(click_ph_)) * env_click_;
+        }
+    }
 
     amp_       *= amp_coef_;
     env_bend_  *= bend_coef_;
     env_punch_ *= punch_coef_;
-    env_click_ *= click_coef_;
+    env_knock_ *= knock_coef_;
+    env_click_ *= (model_ == kKick808) ? thump_coef_ : click_coef_;
+    env_idx_   *= idx_coef_;
 
-    float out = (body + click_lp_ * click_gain_) * gain_;
+    float out = (body + click * click_gain_) * gain_;
     out      += declick_;
     declick_ *= declick_coef_;
     last_     = out;
@@ -154,37 +259,84 @@ void Snare::Init(float sr)
 {
     sr_           = sr;
     c_pitch_      = CoefTau(0.012f, sr);
+    c_burst_      = CoefTau(0.0025f, sr);   /* each clap burst: ~2.5 ms */
     declick_coef_ = CoefTau(0.0015f, sr);
+    model_        = kSnare909;
+    bp_.Reset();
     Set(SnareParams{});
 }
 
 void Snare::Set(const SnareParams& p)
 {
+    p_ = p;
+    Recompute();
+}
+
+void Snare::Recompute()
+{
+    const SnareParams& p = p_;
     const float tune   = Clamp(p.tune_hz, 60.0f, 800.0f);
     const float decay  = Clamp(p.decay_s, 0.03f, 3.0f);
     const float snappy = Clamp(p.snappy, 0.0f, 1.0f);
     const float tone   = Clamp(p.tone, 0.0f, 1.0f);
     const float drive  = Clamp(p.drive, 0.0f, 1.0f);
     const float level  = Clamp(p.level, 0.0f, 1.0f);
+    const float bend   = Clamp(p.bend, 0.0f, 1.0f);
+
+    float ratio = 1.59f, lp_hz, hp_hz;
+    switch (model_)
+    {
+        case kSnare808:
+            /* A ringing, tonal body (two modes nearer a fifth apart, barely
+             * any pitch drop) and brighter, shorter snares. */
+            ratio      = 1.47f;
+            pitch_amt_ = bend * 0.3f;
+            c1_        = Coef60(decay * 1.3f, sr_);
+            c2_        = Coef60(decay * 0.9f, sr_);
+            c_noise_   = Coef60(decay * 0.8f, sr_);
+            lp_hz      = 6000.0f * std::pow(2.3f, tone);
+            hp_hz      = 1500.0f + 2500.0f * tone;
+            noise_gain_ = snappy * 2.6f;
+            body_gain_  = 1.0f - 0.15f * snappy;
+            break;
+
+        case kSnareClap:
+        {
+            /* Three quick noise bursts and a tail, through a band-pass.
+             * Tune places the band (5x: 550 Hz .. 1.65 kHz), Tone opens it
+             * up, Bend spreads the bursts (6 .. 16 ms apart), Snappy sets
+             * the tail against the bursts and Decay its length. */
+            const float centre = Clamp(tune * 5.0f * (0.7f + 0.8f * tone), 200.0f, 0.45f * sr_);
+            bp_.SetG(std::tan(kPi * centre / sr_));
+            bp_.SetK(1.0f / (1.2f + 1.6f * tone));
+            clap_spacing_ = static_cast<uint32_t>((0.006f + 0.010f * bend) * sr_);
+            c_noise_      = Coef60(decay * 1.2f, sr_);
+            tail_gain_    = 0.35f + 0.65f * snappy;
+            noise_gain_   = 5.5f;
+            pitch_amt_    = 0.0f;
+            lp_hz = hp_hz = 1000.0f;
+            break;
+        }
+
+        default:
+            pitch_amt_ = bend * 1.2f;
+            c1_        = Coef60(decay, sr_);
+            c2_        = Coef60(decay * 0.6f, sr_);
+            c_noise_   = Coef60(decay * 1.4f, sr_);
+            /* Tone: the noise low-pass opens from 2.5 kHz to 11 kHz while
+             * the high-pass rises, so bright settings are thinner as well
+             * as brighter. */
+            lp_hz      = 2500.0f * std::pow(4.4f, tone);
+            hp_hz      = 250.0f + 1200.0f * tone;
+            noise_gain_ = snappy * 2.2f;
+            body_gain_  = 1.0f - 0.35f * snappy;
+            break;
+    }
 
     inc1_ = tune / sr_;
-    inc2_ = inc1_ * 1.59f;                 /* the two detuned shell modes */
-
-    c1_      = Coef60(decay, sr_);
-    c2_      = Coef60(decay * 0.6f, sr_);
-    c_noise_ = Coef60(decay * 1.4f, sr_);
-
-    pitch_amt_ = Clamp(p.bend, 0.0f, 1.0f) * 1.2f;
-
-    /* Tone: the noise low-pass opens from 2.5 kHz to 11 kHz while the
-     * high-pass rises, so bright settings are thinner as well as brighter. */
-    const float lp_hz = 2500.0f * std::pow(4.4f, tone);
-    const float hp_hz = 250.0f + 1200.0f * tone;
-    lp_a_ = 1.0f - std::exp(-2.0f * kPi * lp_hz / sr_);
-    hp_a_ = 1.0f - std::exp(-2.0f * kPi * hp_hz / sr_);
-
-    noise_gain_ = snappy * 2.2f;
-    body_gain_  = 1.0f - 0.35f * snappy;
+    inc2_ = inc1_ * ratio;
+    lp_a_ = 1.0f - std::exp(-2.0f * kPi * Clamp(lp_hz, 20.0f, 0.45f * sr_) / sr_);
+    hp_a_ = 1.0f - std::exp(-2.0f * kPi * Clamp(hp_hz, 20.0f, 0.45f * sr_) / sr_);
 
     drive_g_    = 1.0f + drive * drive * 10.0f;
     drive_norm_ = 1.0f / FastTanh(drive_g_);
@@ -195,20 +347,36 @@ void Snare::Set(const SnareParams& p)
 
 void Snare::Trigger(float vel)
 {
+    const int want = (p_.model >= 0 && p_.model < kSnareModelCount) ? p_.model : kSnare909;
+    if (want != model_) { model_ = want; Recompute(); }
+
     vel_         = Clamp(vel, 0.0f, 1.0f);
     gain_target_ = level_ * vel_;
     gain_        = gain_target_;
     declick_     = last_;
     p1_ = p2_ = 0.0f;
-    e1_ = e2_ = e_noise_ = e_pitch_ = 1.0f;
+    if (model_ == kSnareClap)
+    {
+        e1_ = e2_ = e_pitch_ = e_noise_ = 0.0f;
+        e_burst_     = 1.0f;
+        clap_t_      = 0;
+        clap_next_   = clap_spacing_;
+        bursts_left_ = 3;              /* two more bursts, then the tail */
+    }
+    else
+    {
+        e1_ = e2_ = e_noise_ = e_pitch_ = 1.0f;
+        e_burst_     = 0.0f;
+        bursts_left_ = 0;
+    }
 }
 
 float Snare::Tick()
 {
-    if (e1_ < kSilence && e_noise_ < kSilence
+    if (e1_ < kSilence && e_noise_ < kSilence && e_burst_ < kSilence && bursts_left_ == 0
         && declick_ < kSilence && declick_ > -kSilence)
     {
-        e1_ = e2_ = e_noise_ = e_pitch_ = 0.0f;
+        e1_ = e2_ = e_noise_ = e_pitch_ = e_burst_ = 0.0f;
         declick_ = 0.0f;
         last_    = 0.0f;
         return 0.0f;
@@ -216,29 +384,47 @@ float Snare::Tick()
 
     gain_ += 0.002f * (gain_target_ - gain_);
 
-    const float pitch = 1.0f + pitch_amt_ * e_pitch_;
-    p1_ += inc1_ * pitch;
-    p2_ += inc2_ * pitch;
-    if (p1_ >= 1.0f) p1_ -= 1.0f;
-    if (p2_ >= 1.0f) p2_ -= 1.0f;
-    if (p1_ >= 1.0f) p1_ = 0.0f;
-    if (p2_ >= 1.0f) p2_ = 0.0f;
+    float x;
+    if (model_ == kSnareClap)
+    {
+        if (bursts_left_ > 0 && ++clap_t_ >= clap_next_)
+        {
+            if (--bursts_left_ > 0) { e_burst_ = 1.0f; clap_next_ += clap_spacing_; }
+            else                    { e_noise_ = 1.0f; }
+        }
+        float v1, v2;
+        bp_.Tick(noise_.Next(), v1, v2);
+        const float band = v1 * bp_.k;                 /* unity at centre */
+        x = band * (e_burst_ + tail_gain_ * e_noise_) * noise_gain_;
+        e_burst_ *= c_burst_;
+        e_noise_ *= c_noise_;
+    }
+    else
+    {
+        const float pitch = 1.0f + pitch_amt_ * e_pitch_;
+        p1_ += inc1_ * pitch;
+        p2_ += inc2_ * pitch;
+        if (p1_ >= 1.0f) p1_ -= 1.0f;
+        if (p2_ >= 1.0f) p2_ -= 1.0f;
+        if (p1_ >= 1.0f) p1_ = 0.0f;
+        if (p2_ >= 1.0f) p2_ = 0.0f;
 
-    const float body = (Sin01(p1_) * e1_ + 0.55f * Sin01(p2_) * e2_) * body_gain_;
+        const float body = (Sin01(p1_) * e1_ + 0.55f * Sin01(p2_) * e2_) * body_gain_;
 
-    const float n = noise_.Next();
-    lp1_ += lp_a_ * (n - lp1_);
-    lp2_ += lp_a_ * (lp1_ - lp2_);
-    hp_  += hp_a_ * (lp2_ - hp_);
-    const float snares = (lp2_ - hp_) * e_noise_ * noise_gain_;
+        const float n = noise_.Next();
+        lp1_ += lp_a_ * (n - lp1_);
+        lp2_ += lp_a_ * (lp1_ - lp2_);
+        hp_  += hp_a_ * (lp2_ - hp_);
+        const float snares = (lp2_ - hp_) * e_noise_ * noise_gain_;
 
-    float x = body * 0.8f + snares;
+        x = body * 0.8f + snares;
+
+        e1_      *= c1_;
+        e2_      *= c2_;
+        e_noise_ *= c_noise_;
+        e_pitch_ *= c_pitch_;
+    }
     x = FastTanh(x * drive_g_) * drive_norm_;
-
-    e1_      *= c1_;
-    e2_      *= c2_;
-    e_noise_ *= c_noise_;
-    e_pitch_ *= c_pitch_;
 
     float out = x * gain_;
     out      += declick_;
@@ -375,6 +561,140 @@ void Reverb::Tick(float in, float& out_l, float& out_r)
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
+ *  Rumble
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+namespace {
+inline void SetLp(Svf& f, float hz, float sr, float k = 1.41421356f)
+{
+    f.SetG(std::tan(kPi * Clamp(hz, 10.0f, 0.45f * sr) / sr));
+    f.SetK(k);
+}
+} // namespace
+
+void Rumble::Init(float sr, float* mem)
+{
+    sr_  = sr;
+    srl_ = sr / static_cast<float>(kDecim);
+    /* Mutually prime, 37 .. 79 ms: a dense, boomy room. */
+    static const int kLineLen[kLines] = {443, 601, 757, 947};   /* at 12 kHz */
+    static const int kApLen[kNumAp]   = {97, 163};
+    const float scale = srl_ / 12000.0f;
+    for (int i = 0; i < kLines; i++)
+    {
+        line_[i] = mem + i * kMaxLine;
+        int n = static_cast<int>(static_cast<float>(kLineLen[i]) * scale);
+        len_[i] = n < 8 ? 8 : (n > kMaxLine - 4 ? kMaxLine - 4 : n);
+        damp_[i] = 0.0f;
+        for (int k = 0; k < kMaxLine; k++) line_[i][k] = 0.0f;
+    }
+    for (int i = 0; i < kNumAp; i++)
+    {
+        ap_[i] = mem + kLines * kMaxLine + i * kMaxAp;
+        int n = static_cast<int>(static_cast<float>(kApLen[i]) * scale);
+        ap_len_[i] = n < 4 ? 4 : (n > kMaxAp ? kMaxAp : n);
+        ap_pos_[i] = 0;
+        for (int k = 0; k < kMaxAp; k++) ap_[i][k] = 0.0f;
+    }
+    w_ = 0;
+    /* Anti-alias before dropping to 12 kHz, anti-image after coming back. */
+    for (int i = 0; i < 2; i++) { pre_[i].Reset(); SetLp(pre_[i], 1500.0f, sr_); tone_[i].Reset(); }
+    post_.Reset(); SetLp(post_, 900.0f, sr_);
+    damp_a_ = 1.0f - std::exp(-2.0f * kPi * 900.0f / srl_);   /* dark tail */
+    dc_a_   = std::exp(-2.0f * kPi * 20.0f / sr_);
+    dc_x_ = dc_y_ = 0.0f;
+    phase_ = 0;
+    prev_ = cur_ = 0.0f;
+    send_ = 0.0f;
+    amount_ = amount_target_ = 0.0f;
+    Set(RumbleParams{});
+}
+
+void Rumble::Set(const RumbleParams& p)
+{
+    send_target_   = p.on ? 1.0f : 0.0f;
+    const float a  = Clamp(p.amount, 0.0f, 1.0f);
+    amount_target_ = a * a * 1.1f;
+    const float rt60 = Clamp(p.decay_s, 0.2f, 6.0f);
+    for (int i = 0; i < kLines; i++)
+        g_[i] = std::pow(10.0f, -3.0f * static_cast<float>(len_[i]) / (rt60 * srl_));
+    /* Tone: a low-pass before the drive sets the rumble's colour, a second
+     * one an octave and a bit above lets the drive's grit through but
+     * nothing fizzy. */
+    const float tone = Clamp(p.tone_hz, 30.0f, 600.0f);
+    SetLp(tone_[0], tone, srl_);
+    SetLp(tone_[1], tone * 2.5f, srl_);
+    /* Drive: more gain into the shaper, the level pulled back so it reads
+     * as more grit rather than much more volume. */
+    const float d = Clamp(p.drive, 0.0f, 1.0f);
+    drive_pre_  = 1.0f + d * d * 30.0f;     /* zero is clean */
+    drive_post_ = std::pow(drive_pre_, -0.35f);
+}
+
+void Rumble::LowRate(float x)
+{
+    /* Diffuse, so the room swallows the hit rather than echoing it. */
+    for (int i = 0; i < kNumAp; i++)
+    {
+        const float buf = ap_[i][ap_pos_[i]];
+        const float y   = buf - 0.6f * x;
+        ap_[i][ap_pos_[i]] = x + 0.6f * y;
+        if (++ap_pos_[i] >= ap_len_[i]) ap_pos_[i] = 0;
+        x = y;
+    }
+
+    constexpr int kMask = kMaxLine - 1;
+    float d[kLines], sum = 0.0f;
+    for (int i = 0; i < kLines; i++)
+    {
+        const float v = line_[i][(w_ - len_[i]) & kMask];
+        damp_[i] += damp_a_ * (v - damp_[i]);
+        if (damp_[i] < 1.0e-18f && damp_[i] > -1.0e-18f) damp_[i] = 0.0f;
+        d[i] = damp_[i] * g_[i];
+        sum += d[i];
+    }
+    sum *= 0.5f;                              /* Householder feedback */
+    for (int i = 0; i < kLines; i++) line_[i][w_] = x + d[i] - sum;
+    w_ = (w_ + 1) & kMask;
+
+    float wet = (d[0] + d[1] + d[2] + d[3]) * 0.5f;
+
+    /* Tone, drive, then a second low-pass to keep the grit dark. */
+    float v1, v2;
+    tone_[0].Tick(wet, v1, v2);
+    wet = FastTanh(v2 * drive_pre_) * drive_post_;
+    tone_[1].Tick(wet, v1, v2);
+
+    prev_ = cur_;
+    cur_  = v2;
+}
+
+float Rumble::Tick(float in, float pump)
+{
+    send_   += 0.0005f * (send_target_ - send_);         /* ~40 ms */
+    amount_ += 0.0005f * (amount_target_ - amount_);
+
+    float v1, v2;
+    pre_[0].Tick(in * send_, v1, v2);
+    pre_[1].Tick(v2, v1, v2);
+    if (phase_ == 0) LowRate(v2);
+
+    /* Back to full rate: linear interpolation, then a low-pass for images. */
+    const float t = static_cast<float>(phase_ + 1) / static_cast<float>(kDecim);
+    float y = prev_ + t * (cur_ - prev_);
+    if (++phase_ >= kDecim) phase_ = 0;
+    post_.Tick(y, v1, v2);
+    y = v2;
+
+    /* DC blocker: drive is asymmetric under some input. */
+    const float hp = y - dc_x_ + dc_a_ * dc_y_;
+    dc_x_ = y;
+    dc_y_ = (hp < 1.0e-20f && hp > -1.0e-20f) ? 0.0f : hp;
+
+    return dc_y_ * amount_ * pump;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
  *  Duck envelope
  * ═════════════════════════════════════════════════════════════════════════ */
 
@@ -419,12 +739,15 @@ float DuckEnv::Advance(float dt, float attack_s, float hold_s, float release_s, 
  *  Engine
  * ═════════════════════════════════════════════════════════════════════════ */
 
-void Engine::Init(float sample_rate, float* reverb_mem)
+void Engine::Init(float sample_rate, float* mem)
 {
     sr_ = sample_rate;
     kick_.Init(sr_);
     snare_.Init(sr_);
-    reverb_.Init(sr_, reverb_mem);
+    reverb_.Init(sr_, mem);
+    rumble_.Init(sr_, mem + Reverb::kMemFloats);
+    pump_ = 1.0f;
+    rumble_out_ = 0.0f;
     env_k_.Reset();
     env_s_.Reset();
     for (int c = 0; c < 2; c++)
@@ -448,6 +771,7 @@ void Engine::Set(const Params& p)
     kick_.Set(p_.kick);
     snare_.Set(p_.snare);
     reverb_.Set(p_.reverb.amount);
+    rumble_.Set(p_.rumble);
     UpdateFilters();
 }
 
@@ -525,6 +849,11 @@ void Engine::Process(const float* in_l, const float* in_r,
         const float g_target = (ak * as) * (ak * as);
         const float g_step   = (g_target - gain_) * inv;
 
+        /* Rumble pump: the kick's envelope at full depth, whatever Depth
+         * is set to, so the rumble always breathes with the kick. */
+        const float pump_target = (1.0f - ek) * (1.0f - ek);
+        const float pump_step   = (pump_target - pump_) * inv;
+
         const float sk = ek * amt_k, ss = es * amt_s;
         shape_ = sk > ss ? sk : ss;
 
@@ -557,18 +886,24 @@ void Engine::Process(const float* in_l, const float* in_r,
         }
 
         float g  = gain_;
+        float pump = pump_;
         float w0 = w_[0], w1 = w_[1], w2 = w_[2];
+        float rmax = 0.0f;
 
         for (size_t i = 0; i < m; i++)
         {
-            g  += g_step;
+            g    += g_step;
+            pump += pump_step;
             w0 += w_step[0];
             w1 += w_step[1];
             w2 += w_step[2];
 
             const float kick  = kick_.Tick();
             const float snare = snare_.Tick();
-            const float drums = kick + snare;
+            const float rumble = rumble_.Tick(kick, pump);
+            const float drums  = kick + snare + rumble;
+            const float ra     = std::fabs(rumble);
+            if (ra > rmax) rmax = ra;
             float rev_l, rev_r;
             reverb_.Tick(snare + kick * rev_kick, rev_l, rev_r);
             const float x[2]  = {in_l[done + i], in_r[done + i]};
@@ -598,6 +933,8 @@ void Engine::Process(const float* in_l, const float* in_r,
         }
 
         gain_ = g_target;
+        pump_ = pump_target;
+        rumble_out_ = rmax > rumble_out_ ? rmax : rumble_out_ * 0.97f;
         for (int t = 0; t < kDuckTypeCount; t++)
             w_[t] += w_step[t] * static_cast<float>(m);
 

@@ -102,6 +102,7 @@ static HoldPager   pager   (kNumAppPages, kNumPots);
 static Presets     presets (hw.seed.qspi);
 static Settings    settings(hw, &pager);
 static RowCv       row_cv;
+static ButtonBank  buttons;        /* the drum models (host-only state) */
 
 static SettingsRefs refs;           /* setup selectors + CV depth offsets  */
 
@@ -111,9 +112,9 @@ static hostlink::Gauge<float>   g_gain("duck.gain", "Duck gain");
 static hostlink::Gauge<float>   g_cpu("cpu.load", "CPU load");
 
 static blas::Engine engine;
-/* Reverb delay lines live in external SDRAM (too big for the fast internal
+/* Reverb and rumble delay lines live in external SDRAM (too big for the fast internal
  * RAM the rest of the engine uses). Cleared by engine.Init(). */
-static float DSY_SDRAM_BSS reverb_mem[blas::Reverb::kMemFloats];
+static float DSY_SDRAM_BSS reverb_mem[blas::Engine::kMemFloats];
 
 /* ═════════════════════════════════════════════════════════════════════════
  *  Audio
@@ -196,8 +197,9 @@ static void ReadParams(blas::Params& p)
     p.duck.type      = static_cast<int>(k_type.Value());
     p.duck.focus     = k_focus.Norm();
     p.duck.width     = k_width.Norm();
-    p.duck.kick_amt  = k_kick_duck.Norm();
 
+    p.kick.model   = b_kick_model.Zone();
+    p.snare.model  = b_snare_model.Zone();
     p.kick.level   = k_kick_level.Norm();
     p.kick.tune_hz = k_kick_tune.Value();
     p.kick.decay_s = Ms(k_kick_decay);
@@ -205,6 +207,7 @@ static void ReadParams(blas::Params& p)
     p.kick.punch   = k_kick_punch.Norm();
     p.kick.click   = k_kick_click.Norm();
     p.kick.drive   = k_kick_drive.Norm();
+    p.kick.sweep   = k_kick_sweep.Norm();
 
     p.snare.level   = k_snare_level.Norm();
     p.snare.tune_hz = k_snare_tune.Value();
@@ -213,6 +216,11 @@ static void ReadParams(blas::Params& p)
     p.snare.tone    = k_snare_tone.Norm();
     p.snare.bend    = k_snare_bend.Norm();
     p.reverb.amount = k_reverb.Norm();
+    p.rumble.on      = b_rumble_on.Zone() != 0u;
+    p.rumble.amount  = k_rumble_amount.Norm();
+    p.rumble.tone_hz = k_rumble_tone.Value();
+    p.rumble.decay_s = k_rumble_decay.Value();
+    p.rumble.drive   = k_rumble_drive.Norm();
     p.reverb.kick   = reverb_kick;
     p.snare.drive   = k_snare_drive.Norm();
 }
@@ -365,6 +373,13 @@ static void Autosave(uint32_t t_ms)
     else                 autosave_ok = false;   /* don't hammer a failing flash */
 }
 
+/* After a model change, that row's two main rings show which model is on. */
+static constexpr uint32_t kShowModelMs  = 1200u;
+static int8_t             show_model_row = -1;
+static uint32_t           show_model_ms  = 0;
+static bool               show_rumble    = false;   /* after the on/off combo */
+static uint32_t           show_rumble_ms = 0;
+
 static void OnFrame()
 {
     const float* phys = loop.Phys();
@@ -374,9 +389,30 @@ static void OnFrame()
     /* Tap: toggle between the main page and the tapped row's options. */
     if (act.nav_row >= 0)
     {
-        const uint8_t target = static_cast<uint8_t>(1 + act.nav_row);
-        pager.GoToPage(pager.Page() == target ? kPageMain : target, phys);
+        pager.GoToPage(NextPageOnTap(static_cast<uint8_t>(act.nav_row), pager.Page()), phys);
     }
+    /* Hold one button, tap another. Hold B2 + tap B3: next kick model.
+     * Hold B3 + tap B2: next snare model. Hold B2 + tap B1: rumble on/off.
+     * The other three are free. */
+    if (act.combo_held == kRowKick && act.combo_tap == kRowSnare)
+    {
+        buttons.SetZone(b_kick_model, static_cast<uint8_t>((b_kick_model.Zone() + 1u) % blas::kKickModelCount));
+        show_model_row = kRowKick;
+        show_model_ms  = now_ms;
+    }
+    else if (act.combo_held == kRowSnare && act.combo_tap == kRowKick)
+    {
+        buttons.SetZone(b_snare_model, static_cast<uint8_t>((b_snare_model.Zone() + 1u) % blas::kSnareModelCount));
+        show_model_row = kRowSnare;
+        show_model_ms  = now_ms;
+    }
+    else if (act.combo_held == kRowKick && act.combo_tap == kRowDuck)
+    {
+        buttons.SetZone(b_rumble_on, b_rumble_on.Zone() ? 0u : 1u);
+        show_rumble_ms = now_ms;
+        show_rumble    = true;
+    }
+
     /* Hold + turn: the knob's position becomes its CV depth. */
     if (act.depth_pot >= 0)
         WriteDepth(pager.Page(), static_cast<uint8_t>(act.depth_pot), act.depth_pos);
@@ -416,6 +452,32 @@ static void DrawDepthRing(uint8_t pot, float depth, bool active)
     DrawFill(hw.leds, pot, hw.Arc(), depth, desc);
 }
 
+/** The current model as a row of zones around the ring: lit = selected. */
+static void DrawModelRing(uint8_t pot, uint8_t zone, uint8_t zones, LedPanel::Rgb c)
+{
+    const ArcGeometry& geo = hw.Arc();
+    hw.leds.ClearRing(pot);
+    const uint8_t per = static_cast<uint8_t>(geo.arc_leds / zones);
+    for (uint8_t z = 0; z < zones; z++)
+    {
+        const LedPanel::Rgb col = (z == zone) ? c : LedPanel::Scale(kWhite, 0.08f);
+        for (uint8_t k = 0; k + 1u < per; k++)   /* a gap between zones */
+        {
+            float hour = geo.start_hour + geo.step_hours * static_cast<float>(z * per + k);
+            while (hour >= 12.0f) hour -= 12.0f;
+            while (hour < 0.0f)   hour += 12.0f;
+            hw.leds.SetRingByHour(pot, hour, hw.leds.ScaleGlobal(col));
+        }
+    }
+}
+
+static inline LedPanel::Rgb RowColorNow(uint8_t row)
+{
+    if (row == kRowKick)  return kKickModelColor[b_kick_model.Zone() % blas::kKickModelCount];
+    if (row == kRowSnare) return kSnareModelColor[b_snare_model.Zone() % blas::kSnareModelCount];
+    return kRowColor[row];
+}
+
 static void OnRender(uint32_t t_ms)
 {
     if (settings.IsActive()) return;
@@ -428,8 +490,9 @@ static void OnRender(uint32_t t_ms)
      * bright. B1 dims with the ducking; B2 and B3 flash on their drum. */
     for (uint8_t i = 0; i < kNumButtons; i++)
     {
-        float k = (page == kPageMain) ? 0.35f : (page == 1u + i ? 1.0f : 0.06f);
-        LedPanel::Rgb c = kRowColor[i];
+        const int row_of_page = PageRow(page);
+        float k = (row_of_page < 0) ? 0.35f : (row_of_page == static_cast<int>(i) ? 1.0f : 0.06f);
+        LedPanel::Rgb c = (page == kPageRumble && i == kRowKick) ? kRumbleColor : RowColorNow(i);
         if (i == kRowDuck)
         {
             k *= 0.25f + 0.75f * meter_gain;
@@ -445,6 +508,26 @@ static void OnRender(uint32_t t_ms)
         }
         if (held_row == static_cast<int8_t>(i)) { c = kWhite; k = 0.8f; }
         hw.leds.SetButtonPair(i, hw.leds.ScaleGlobal(LedPanel::Scale(c, k)));
+    }
+
+    /* Rumble on/off: the kick's two rings show off (left) or on (right). */
+    if (show_rumble && (t_ms - show_rumble_ms) < kShowModelMs)
+    {
+        const uint8_t on = b_rumble_on.Zone() ? 1u : 0u;
+        DrawModelRing(2u, on, 2u, kRumbleColor);
+        DrawModelRing(3u, on, 2u, kRumbleColor);
+    }
+
+    /* Model change: the row's two main-page rings show the model. */
+    if (show_model_row >= 0 && (t_ms - show_model_ms) < kShowModelMs)
+    {
+        const bool    kick  = (show_model_row == kRowKick);
+        const uint8_t zone  = kick ? b_kick_model.Zone() : b_snare_model.Zone();
+        const uint8_t zones = kick ? static_cast<uint8_t>(blas::kKickModelCount)
+                                   : static_cast<uint8_t>(blas::kSnareModelCount);
+        const uint8_t pot   = static_cast<uint8_t>(2 * show_model_row);
+        DrawModelRing(pot,      zone, zones, RowColorNow(static_cast<uint8_t>(show_model_row)));
+        DrawModelRing(pot + 1u, zone, zones, RowColorNow(static_cast<uint8_t>(show_model_row)));
     }
 
     /* Hold: after a moment the row's rings show their CV depths (white =
@@ -511,7 +594,7 @@ static void SeedDefaults()
     Seed(kPageKick, k_kick_punch, d.kick.punch * 100.f);
     Seed(kPageKick, k_kick_click, d.kick.click * 100.f);
     Seed(kPageKick, k_kick_drive, d.kick.drive * 100.f);
-    Seed(kPageKick, k_kick_duck,  d.duck.kick_amt * 100.f);
+    Seed(kPageKick, k_kick_sweep, d.kick.sweep * 100.f);
 
     Seed(kPageSnare, k_snare_decay,  d.snare.decay_s * 1000.f);
     Seed(kPageSnare, k_snare_snappy, d.snare.snappy * 100.f);
@@ -519,6 +602,11 @@ static void SeedDefaults()
     Seed(kPageSnare, k_snare_bend,   d.snare.bend * 100.f);
     Seed(kPageSnare, k_snare_drive,  d.snare.drive * 100.f);
     Seed(kPageSnare, k_reverb,       d.reverb.amount * 100.f);
+
+    Seed(kPageRumble, k_rumble_amount, d.rumble.amount * 100.f);
+    Seed(kPageRumble, k_rumble_tone,   d.rumble.tone_hz);
+    Seed(kPageRumble, k_rumble_decay,  d.rumble.decay_s);
+    Seed(kPageRumble, k_rumble_drive,  d.rumble.drive * 100.f);
 }
 
 int main()
@@ -544,6 +632,7 @@ int main()
     pager.SetPageColor(kPageDuck,  kRowColor[kRowDuck]);
     pager.SetPageColor(kPageKick,  kRowColor[kRowKick]);
     pager.SetPageColor(kPageSnare, kRowColor[kRowSnare]);
+    pager.SetPageColor(kPageRumble, kRumbleColor);
 
     k_depth.Overdraw(DrawDuckMeter);
     DeclareSettings(settings, presets, row_cv, refs);
@@ -569,6 +658,8 @@ int main()
     /* Preset payload. The first slot doubles as the live state (see Autosave). */
     presets.Manage(pager);
     presets.Manage(settings);
+    buttons.Global(b_kick_model).Global(b_snare_model).Global(b_rumble_on);
+    presets.Manage(buttons);
     host.Fast(pager, settings);
     presets.UseNames();
 
@@ -579,6 +670,8 @@ int main()
         .Use(page_duck)
         .Use(page_kick)
         .Use(page_snare)
+        .Use(page_rumble)
+        .Use(buttons)
         .Use(host)
         .OnPoll(OnPoll)
         .OnFrame(OnFrame)
